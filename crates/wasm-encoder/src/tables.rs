@@ -5,15 +5,13 @@ use super::*;
 /// # Example
 ///
 /// ```
-/// use wasm_encoder::{Module, TableSection, TableType, Limits, ValType};
+/// use wasm_encoder::{Module, TableSection, TableType, ValType};
 ///
 /// let mut tables = TableSection::new();
 /// tables.table(TableType {
 ///     element_type: ValType::FuncRef,
-///     limits: Limits {
-///         min: 128,
-///         max: None,
-///     },
+///     minimum: 128,
+///     maximum: None,
 /// });
 ///
 /// let mut module = Module::new();
@@ -21,6 +19,7 @@ use super::*;
 ///
 /// let wasm_bytes = module.finish();
 /// ```
+#[derive(Clone, Debug)]
 pub struct TableSection {
     bytes: Vec<u8>,
     num_added: u32,
@@ -33,6 +32,11 @@ impl TableSection {
             bytes: vec![],
             num_added: 0,
         }
+    }
+
+    /// How many tables have been defined inside this section so far?
+    pub fn len(&self) -> u32 {
+        self.num_added
     }
 
     /// Define a table.
@@ -63,16 +67,27 @@ impl Section for TableSection {
 }
 
 /// A table's type.
+#[derive(Clone, Copy, Debug)]
 pub struct TableType {
     /// The table's element type.
     pub element_type: ValType,
-    /// The table's limits.
-    pub limits: Limits,
+    /// Minimum size, in elements, of this table
+    pub minimum: u32,
+    /// Maximum size, in elements, of this table
+    pub maximum: Option<u32>,
 }
 
 impl TableType {
     pub(crate) fn encode(&self, bytes: &mut Vec<u8>) {
         bytes.push(self.element_type.into());
-        self.limits.encode(bytes);
+        let mut flags = 0;
+        if self.maximum.is_some() {
+            flags |= 0b001;
+        }
+        bytes.push(flags);
+        bytes.extend(encoders::u32(self.minimum));
+        if let Some(max) = self.maximum {
+            bytes.extend(encoders::u32(max));
+        }
     }
 }

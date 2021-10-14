@@ -51,6 +51,7 @@ impl<T: WasmModuleResources> FuncValidator<T> {
     pub fn validate(&mut self, body: &FunctionBody<'_>) -> Result<()> {
         let mut reader = body.get_binary_reader();
         self.read_locals(&mut reader)?;
+        reader.allow_memarg64(self.validator.features.memory64);
         while !reader.eof() {
             let pos = reader.original_position();
             let op = reader.read_operator()?;
@@ -130,7 +131,7 @@ mod tests {
         fn memory_at(&self, _at: u32) -> Option<crate::MemoryType> {
             todo!()
         }
-        fn event_at(&self, _at: u32) -> Option<crate::EventType> {
+        fn tag_at(&self, _at: u32) -> Option<&Self::FuncType> {
             todo!()
         }
         fn global_at(&self, _at: u32) -> Option<crate::GlobalType> {

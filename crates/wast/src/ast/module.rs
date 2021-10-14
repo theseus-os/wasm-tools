@@ -8,6 +8,7 @@ pub use crate::resolve::Names;
 /// This is the top-level type which you'll frequently parse when working with
 /// this crate. A `*.wat` file is either one `module` s-expression or a sequence
 /// of s-expressions that are module fields.
+#[derive(Debug)]
 pub struct Wat<'a> {
     #[allow(missing_docs)]
     pub module: Module<'a>,
@@ -36,6 +37,7 @@ impl<'a> Parse<'a> for Wat<'a> {
 }
 
 /// A parsed WebAssembly module.
+#[derive(Debug)]
 pub struct Module<'a> {
     /// Where this `module` was defined
     pub span: ast::Span,
@@ -48,6 +50,7 @@ pub struct Module<'a> {
 }
 
 /// The different kinds of ways to define a module.
+#[derive(Debug)]
 pub enum ModuleKind<'a> {
     /// A module defined in the textual s-expression format.
     Text(Vec<ModuleField<'a>>),
@@ -166,11 +169,10 @@ pub enum ModuleField<'a> {
     Memory(ast::Memory<'a>),
     Global(ast::Global<'a>),
     Export(ast::Export<'a>),
-    ExportAll(ast::Span, ast::Id<'a>),
-    Start(ast::Index<'a>),
+    Start(ast::ItemRef<'a, kw::func>),
     Elem(ast::Elem<'a>),
     Data(ast::Data<'a>),
-    Event(ast::Event<'a>),
+    Tag(ast::Tag<'a>),
     Custom(ast::Custom<'a>),
     Instance(ast::Instance<'a>),
     NestedModule(ast::NestedModule<'a>),
@@ -208,15 +210,11 @@ impl<'a> Parse<'a> for ModuleField<'a> {
             return Ok(ModuleField::Global(parser.parse()?));
         }
         if parser.peek::<kw::export>() {
-            if parser.peek2::<ast::Id>() {
-                let span = parser.parse::<kw::export>()?.0;
-                return Ok(ModuleField::ExportAll(span, parser.parse()?));
-            }
             return Ok(ModuleField::Export(parser.parse()?));
         }
         if parser.peek::<kw::start>() {
             parser.parse::<kw::start>()?;
-            return Ok(ModuleField::Start(parser.parse()?));
+            return Ok(ModuleField::Start(parser.parse::<ast::IndexOrRef<_>>()?.0));
         }
         if parser.peek::<kw::elem>() {
             return Ok(ModuleField::Elem(parser.parse()?));
@@ -224,8 +222,8 @@ impl<'a> Parse<'a> for ModuleField<'a> {
         if parser.peek::<kw::data>() {
             return Ok(ModuleField::Data(parser.parse()?));
         }
-        if parser.peek::<kw::event>() {
-            return Ok(ModuleField::Event(parser.parse()?));
+        if parser.peek::<kw::tag>() {
+            return Ok(ModuleField::Tag(parser.parse()?));
         }
         if parser.peek::<annotation::custom>() {
             return Ok(ModuleField::Custom(parser.parse()?));

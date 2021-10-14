@@ -7,16 +7,14 @@ use super::*;
 /// ```
 /// use wasm_encoder::{
 ///     Elements, ElementSection, Instruction, Module, TableSection, TableType,
-///     Limits, ValType,
+///     ValType,
 /// };
 ///
 /// let mut tables = TableSection::new();
 /// tables.table(TableType {
 ///     element_type: ValType::FuncRef,
-///     limits: Limits {
-///         min: 128,
-///         max: None,
-///     },
+///     minimum: 128,
+///     maximum: None,
 /// });
 ///
 /// let mut elements = ElementSection::new();
@@ -35,12 +33,14 @@ use super::*;
 ///
 /// let wasm_bytes = module.finish();
 /// ```
+#[derive(Clone, Debug)]
 pub struct ElementSection {
     bytes: Vec<u8>,
     num_added: u32,
 }
 
 /// A sequence of elements in a segment in the element section.
+#[derive(Clone, Copy, Debug)]
 pub enum Elements<'a> {
     /// A sequences of references to functions by their indices.
     Functions(&'a [u32]),
@@ -49,6 +49,7 @@ pub enum Elements<'a> {
 }
 
 /// An element in a segment in the element section.
+#[derive(Clone, Copy, Debug)]
 pub enum Element {
     /// A null reference.
     Null,
@@ -57,6 +58,7 @@ pub enum Element {
 }
 
 /// An element segment's mode.
+#[derive(Clone, Copy, Debug)]
 pub enum ElementMode<'a> {
     /// A passive element segment.
     ///
@@ -79,6 +81,7 @@ pub enum ElementMode<'a> {
 }
 
 /// An element segment in the element section.
+#[derive(Clone, Copy, Debug)]
 pub struct ElementSegment<'a> {
     /// The element segment's mode.
     pub mode: ElementMode<'a>,
@@ -95,6 +98,11 @@ impl ElementSection {
             bytes: vec![],
             num_added: 0,
         }
+    }
+
+    /// How many segments have been defined inside this section so far?
+    pub fn len(&self) -> u32 {
+        self.num_added
     }
 
     /// Define an element segment.

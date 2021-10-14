@@ -25,10 +25,7 @@
 
 use anyhow::{bail, Context, Result};
 use rayon::prelude::*;
-use std::env;
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::str;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use wasmparser::*;
@@ -134,29 +131,17 @@ fn skip_test(test: &Path, contents: &[u8]) -> bool {
         "dump/reference-types.txt",
         "interp/reference-types.txt",
         "expr/reference-types.txt",
-        "parse/all-features.txt",
-        // uses old exception handling proposal
-        // FIXME: remove when wabt starts supporting the new proposal
-        "desugar/try.txt",
-        "dump/br_on_exn.txt",
-        "dump/rethrow.txt",
-        "dump/try.txt",
-        "dump/try-multi.txt",
-        "expr/br_on_exn.txt",
-        "expr/rethrow.txt",
-        "expr/try.txt",
-        "expr/try-multi.txt",
-        "roundtrip/fold-br_on_exn.txt",
-        "roundtrip/fold-rethrow.txt",
-        "roundtrip/fold-try.txt",
-        "roundtrip/rethrow.txt",
+        // TODO: this proposal needs to be merged with the upstream spec to pick
+        // up a fix to this test case since otherwise this test asserts that
+        // something is invalid which the spec asserts is valid.
+        "exception-handling/unreached-invalid.wast",
     ];
     if broken.iter().any(|x| test.ends_with(x)) {
         return true;
     }
 
-    // FIXME(WebAssembly/wabt#1404) - wast2json infinite loops here on macos
-    if test.ends_with("annotations.wast") {
+    // TODO: the gc proposal isn't implemented yet
+    if test.iter().any(|p| p == "gc") {
         return true;
     }
 
@@ -178,12 +163,6 @@ fn skip_test(test: &Path, contents: &[u8]) -> bool {
 #[derive(Default)]
 struct TestState {
     ntests: AtomicUsize,
-    wabt_available: AtomicUsize,
-}
-
-struct Wast2Json {
-    _td: tempfile::TempDir,
-    modules: Vec<PathBuf>,
 }
 
 impl TestState {
@@ -209,20 +188,6 @@ impl TestState {
         let binary = wat::parse_file(test)?;
         self.bump_ntests();
 
-        // Next up, if enabled, we execute `wat2wasm` to make sure `wat
-        // `produces the same binary encoding.
-        //
-        // Currently our encoding of tests two tests differs from wabt, but
-        // they're invalid anyway so it's not that worrisome.
-        if !test.ends_with("invalid-data-segment-offset.txt")
-            && !test.ends_with("invalid-elem-segment-offset.txt")
-        {
-            if let Some(expected) = self.wat2wasm(&test)? {
-                self.binary_compare(&binary, &expected, true)
-                    .context("`wat` doesn't match wabt's `wat2wasm`")?;
-            }
-        }
-
         let contents = str::from_utf8(contents)?;
 
         // Finally we test that this is indeed a valid wasm file. Note,
@@ -231,17 +196,12 @@ impl TestState {
         //
         // TODO: implement function-references in wasmparser
         // TODO: implement gc types in wasmparser
-        // TODO: implement exceptions in wasmparser
-        if !contents.contains("--enable-exceptions")
-            && !contents.contains("--enable-function-references")
+        if !contents.contains("--enable-function-references")
             && !contents.contains("--enable-gc")
             && !contents.contains("--no-check")
             // intentionally invalid wasm files
             && !contents.contains(";; TOOL: wat-desugar")
-            && !test.ends_with("dump/event.txt")
             && !test.ends_with("dump/import.txt")
-            // uses exceptions
-            && !test.ends_with("parse/all-features.txt")
         {
             self.test_wasm(test, &binary, true)
                 .context("failed testing the binary output of `wat`")?;
@@ -262,42 +222,6 @@ impl TestState {
         // matches wabt.
         let string = wasmprinter::print_bytes(contents).context("failed to print wasm")?;
         self.bump_ntests();
-        if !test.ends_with("local/reloc.wasm")
-            // FIXME(WebAssembly/wabt#1447)
-            && !test.ends_with("bulk-memory-operations/binary.wast")
-            && !test.ends_with("reference-types/binary.wast")
-            && !test.ends_with("exception-handling/binary.wast")
-
-            // wabt uses the old exceptions proposal
-            && !test.ends_with("local/exception-handling.wast")
-
-            // not implemented in wabt
-            && !test.iter().any(|t| t == "module-linking")
-            && !test.ends_with("multi-memory.wast")
-
-            // wabt uses old instruction names for atomics
-            && !test.ends_with("atomic-no-shared-memory.txt")
-            && !test.ends_with("fold-atomic.txt")
-            && !test.ends_with("atomic.txt")
-            && !test.ends_with("atomic64.txt")
-            && !test.ends_with("atomic-align.txt")
-            && !test.ends_with("atomic.wast")
-            && !test.ends_with("local/memory64.wast")
-
-            // FIXME uses simd instrs not implemented in wabt yet.
-            && !test.ends_with("local/simd.wat")
-            && !test.ends_with("simd/simd_load_zero.wast")
-            && !test.ends_with("simd/simd_i32x4_dot_i16x8.wast")
-
-            // FIXME wabt doesn't print conflict or empty names in the same way
-            // that we do.
-            && !test.ends_with("local/names.wast")
-        {
-            if let Some(expected) = self.wasm2wat(contents)? {
-                self.string_compare(&string, &expected)
-                    .context("`wasmprinter` disagrees with `wabt`")?;
-            }
-        }
 
         // If we can, convert the string back to bytes and assert it has the
         // same binary representation.
@@ -326,28 +250,12 @@ impl TestState {
         let wast = parser::parse::<Wast>(&buf).map_err(|e| adjust!(e))?;
         self.bump_ntests();
 
-        let json = self.wast2json(&test)?;
-
-        // Pair each `Module` directive with the result of wast2json's output
-        // `*.wasm` file, and then execute each test in parallel.
-        let mut modules = 0;
-        let directives = wast
+        let errors = wast
             .directives
-            .into_iter()
-            .map(|directive| match directive {
-                WastDirective::Module(_) => {
-                    modules += 1;
-                    (directive, json.as_ref().map(|j| &j.modules[modules - 1]))
-                }
-                other => (other, None),
-            })
-            .collect::<Vec<_>>();
-
-        let errors = directives
             .into_par_iter()
-            .filter_map(|(directive, expected)| {
+            .filter_map(|directive| {
                 let (line, col) = directive.span().linecol_in(contents);
-                self.test_wast_directive(test, directive, expected)
+                self.test_wast_directive(test, directive)
                     .with_context(|| {
                         format!(
                             "failed directive on {}:{}:{}",
@@ -374,12 +282,7 @@ impl TestState {
         bail!("{}", s)
     }
 
-    fn test_wast_directive(
-        &self,
-        test: &Path,
-        directive: WastDirective,
-        expected: Option<&PathBuf>,
-    ) -> Result<()> {
+    fn test_wast_directive(&self, test: &Path, directive: WastDirective) -> Result<()> {
         // Only test parsing and encoding of modules that wabt doesn't support
         let skip_verify = test.iter().any(|t| t == "function-references");
 
@@ -391,14 +294,7 @@ impl TestState {
                     return Ok(());
                 }
                 let test_roundtrip = match module.kind {
-                    ModuleKind::Text(_) => {
-                        if let Some(expected) = &expected {
-                            let expected = fs::read(expected)?;
-                            self.binary_compare(&actual, &expected, true)
-                                .context("`wat` doesn't match output of wabt")?;
-                        }
-                        true
-                    }
+                    ModuleKind::Text(_) => true,
 
                     // Don't test the wasmprinter round trip since these bytes
                     // may not be in their canonical form (didn't come from teh
@@ -417,7 +313,7 @@ impl TestState {
                 if skip_verify {
                     return Ok(());
                 }
-                self.parse_quote_module(test, &source)?;
+                self.test_quote_module(test, &source)?;
             }
 
             WastDirective::AssertMalformed {
@@ -428,9 +324,9 @@ impl TestState {
                 if skip_verify {
                     return Ok(());
                 }
-                let result = self.parse_quote_module(test, &source);
+                let result = self.test_quote_module(test, &source);
                 match result {
-                    Ok(()) => bail!(
+                    Ok(_) => bail!(
                         "parsed successfully but should have failed with: {}",
                         message,
                     ),
@@ -444,15 +340,27 @@ impl TestState {
                 }
             }
             WastDirective::AssertInvalid {
-                mut module,
+                module,
                 message,
                 span: _,
             } => {
-                let wasm = module.encode()?;
                 self.bump_ntests();
                 if skip_verify {
                     return Ok(());
                 }
+
+                // Our error for these tests is happening as a parser error of
+                // the text file, not a validation error of the binary. It's not
+                // really worth it contorting ourselves to have the exact same
+                // location of error, so skip these tests.
+                if message == "memory size must be at most 65536 pages (4GiB)" {
+                    return Ok(());
+                }
+
+                let wasm = match module {
+                    QuoteModule::Module(mut m) => m.encode()?,
+                    QuoteModule::Quote(list) => self.parse_quote_module(test, &list)?,
+                };
                 let e = self.test_wasm_invalid(test, &wasm)?;
                 if !error_matches(e.message(), message) {
                     bail!(
@@ -483,8 +391,7 @@ impl TestState {
     }
 
     fn test_wasm_valid(&self, test: &Path, contents: &[u8]) -> Result<()> {
-        let validator = self.wasmparser_validator_for(test);
-        validator.validate_all(contents)?;
+        self.wasmparser_validator_for(test).validate_all(contents)?;
         self.bump_ntests();
         Ok(())
     }
@@ -500,54 +407,7 @@ impl TestState {
         }
     }
 
-    fn string_compare(&self, actual: &str, expected: &str) -> Result<()> {
-        let actual = normalize(&actual);
-        let expected = normalize(&expected);
-
-        fn normalize(s: &str) -> String {
-            let mut s = s.trim().to_string();
-
-            // We seem to have different decimal float printing than wabt, and a
-            // hand-check seems to show that they're equivalent just different
-            // renderings. To paper over these inconsequential differences delete
-            // these comments.
-            while let Some(i) = s.find(" (;=") {
-                let end = s[i..].find(";)").unwrap();
-                s.drain(i..end + i + 2);
-            }
-            return s;
-        }
-
-        let mut bad = false;
-        let mut result = String::new();
-        for diff in diff::lines(&expected, &actual) {
-            match diff {
-                diff::Result::Left(s) => {
-                    bad = true;
-                    result.push_str("-");
-                    result.push_str(s);
-                }
-                diff::Result::Right(s) => {
-                    bad = true;
-                    result.push_str("+");
-                    result.push_str(s);
-                }
-                diff::Result::Both(s, _) => {
-                    result.push_str(" ");
-                    result.push_str(s);
-                }
-            }
-            result.push_str("\n");
-        }
-        if bad {
-            bail!("expected != actual\n\n{}", result);
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Parses a quoted module, then asserts that it's valid.
-    fn parse_quote_module(&self, test: &Path, source: &[&[u8]]) -> Result<()> {
+    fn parse_quote_module(&self, test: &Path, source: &[&[u8]]) -> Result<Vec<u8>> {
         let mut ret = String::new();
         for src in source {
             match str::from_utf8(src) {
@@ -559,9 +419,22 @@ impl TestState {
         let buf = ParseBuffer::new(&ret)?;
         let mut wat = parser::parse::<Wat>(&buf)?;
         self.bump_ntests();
-        let binary = wat.module.encode()?;
+
+        // TODO: when memory64 merges into the proper spec then this should be
+        // removed since it will presumably no longer be a text-format error but
+        // rather a validation error. Currently all non-memory64 proposals
+        // assert that this offset is a text-parser error, whereas with memory64
+        // support that error is deferred until later.
+        if ret.contains("offset=4294967296") && !test.iter().any(|t| t == "memory64") {
+            bail!("i32 constant out of bounds");
+        }
+        Ok(wat.module.encode()?)
+    }
+
+    fn test_quote_module(&self, test: &Path, source: &[&[u8]]) -> Result<()> {
+        let wasm = self.parse_quote_module(test, source)?;
         self.bump_ntests();
-        self.test_wasm(test, &binary, true)?;
+        self.test_wasm(test, &wasm, true)?;
         Ok(())
     }
 
@@ -672,10 +545,11 @@ impl TestState {
             threads: true,
             reference_types: true,
             simd: true,
+            relaxed_simd: true,
             exceptions: true,
             bulk_memory: true,
             tail_call: true,
-            module_linking: true,
+            module_linking: false,
             deterministic_only: false,
             multi_value: true,
             multi_memory: true,
@@ -683,14 +557,19 @@ impl TestState {
         };
         for part in test.iter().filter_map(|t| t.to_str()) {
             match part {
-                "testsuite" | "wasmtime905.wast" | "missing-features" => {
+                "testsuite" | "missing-features" => {
                     features = WasmFeatures::default();
-                    if part == "testsuite" {
-                        features.bulk_memory = false;
-                        features.reference_types = false;
-                    }
                 }
-                "threads" => features.threads = true,
+                "wasmtime905.wast" => {
+                    features = WasmFeatures::default();
+                    features.bulk_memory = false;
+                    features.reference_types = false;
+                }
+                "threads" => {
+                    features.threads = true;
+                    features.reference_types = false;
+                    features.bulk_memory = false;
+                }
                 "simd" => features.simd = true,
                 "reference-types" => {
                     features.bulk_memory = true;
@@ -707,6 +586,7 @@ impl TestState {
                     features.memory64 = true;
                     features.bulk_memory = true;
                 }
+                "module-linking" => features.module_linking = true,
                 _ => {}
             }
         }
@@ -717,121 +597,6 @@ impl TestState {
 
     fn bump_ntests(&self) {
         self.ntests.fetch_add(1, SeqCst);
-    }
-
-    fn wat2wasm(&self, test: &Path) -> Result<Option<Vec<u8>>> {
-        if !self.wabt_available()? {
-            return Ok(None);
-        }
-        let f = tempfile::NamedTempFile::new()?;
-        let result = Command::new("wat2wasm")
-            .arg(test)
-            .arg("--enable-all")
-            .arg("--no-check")
-            .arg("-o")
-            .arg(f.path())
-            .output()
-            .context("failed to spawn `wat2wasm`")?;
-        Ok(if result.status.success() {
-            Some(fs::read(f.path())?)
-        } else {
-            // TODO: handle this case better
-            None
-        })
-    }
-
-    fn wasm2wat(&self, contents: &[u8]) -> Result<Option<String>> {
-        if !self.wabt_available()? {
-            return Ok(None);
-        }
-        let f = tempfile::TempDir::new().unwrap();
-        let wasm = f.path().join("wasm");
-        let wat = f.path().join("wat");
-        fs::write(&wasm, contents).context("failed to write wasm file")?;
-        let result = Command::new("wasm2wat")
-            .arg(&wasm)
-            .arg("--enable-all")
-            .arg("--no-check")
-            .arg("-o")
-            .arg(&wat)
-            .output()
-            .context("failed to spawn `wasm2wat`")?;
-        if result.status.success() {
-            Ok(Some(
-                fs::read_to_string(&wat).context("failed to read wat file")?,
-            ))
-        } else {
-            bail!(
-                "failed to run wasm2wat: {}\n\n    {}",
-                result.status,
-                String::from_utf8_lossy(&result.stderr).replace("\n", "\n    "),
-            )
-        }
-    }
-
-    fn wast2json(&self, test: &Path) -> Result<Option<Wast2Json>> {
-        if !self.wabt_available()? {
-            return Ok(None);
-        }
-        let td = tempfile::TempDir::new()?;
-        let result = Command::new("wast2json")
-            .arg(test)
-            .arg("--enable-all")
-            .arg("--no-check")
-            .arg("-o")
-            .arg(td.path().join("foo.json"))
-            .output()
-            .context("failed to spawn `wat2wasm`")?;
-        if !result.status.success() {
-            // TODO: handle this case better
-            return Ok(None);
-        }
-        let json = fs::read_to_string(td.path().join("foo.json"))?;
-        let json: serde_json::Value = serde_json::from_str(&json)?;
-        let commands = json["commands"].as_array().unwrap();
-        let modules = commands
-            .iter()
-            .filter_map(|m| {
-                if m["type"] == "module" {
-                    Some(td.path().join(m["filename"].as_str().unwrap()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        Ok(Some(Wast2Json { _td: td, modules }))
-    }
-
-    fn wabt_available(&self) -> Result<bool> {
-        // Check if we've cached whether wabt is available...
-        match self.wabt_available.load(SeqCst) {
-            1 => return Ok(false),
-            2 => return Ok(true),
-            _ => {}
-        }
-
-        // ... otherwise figure it out ourselves and try to be the singular
-        // thread which flags whether wabt is here or not.
-        let available = Command::new("wasm2wat").arg("--version").output().is_ok() as usize + 1;
-        if self
-            .wabt_available
-            .compare_exchange(0, available, SeqCst, SeqCst)
-            .is_ok()
-        {
-            // If we were the singular thread to indicate whether we know wabt
-            // is available or not, then we also return an error if it's
-            // supposed to be available and it's not.
-            if available == 1 && env::var("SKIP_WABT").is_err() {
-                bail!(
-                    "\
-                        failed to locate `wabt` tools as a reference to run tests \
-                        against; you either install wabt from the `tests/wabt` \
-                        directory or set the SKIP_WABT=1 env var to fix this
-                    "
-                )
-            }
-        }
-        Ok(available == 2)
     }
 }
 

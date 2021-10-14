@@ -83,13 +83,12 @@ fuzz_target!(|data: Vec<Vec<u8>>| {
             (ImportSection(a), ImportSection(b)) => assert_eq!(a.range(), b.range()),
             (AliasSection(a), AliasSection(b)) => assert_eq!(a.range(), b.range()),
             (InstanceSection(a), InstanceSection(b)) => assert_eq!(a.range(), b.range()),
-            (ModuleSection(a), ModuleSection(b)) => assert_eq!(a.range(), b.range()),
             (FunctionSection(a), FunctionSection(b)) => assert_eq!(a.range(), b.range()),
             (TableSection(a), TableSection(b)) => assert_eq!(a.range(), b.range()),
             (MemorySection(a), MemorySection(b)) => assert_eq!(a.range(), b.range()),
             (GlobalSection(a), GlobalSection(b)) => assert_eq!(a.range(), b.range()),
             (ExportSection(a), ExportSection(b)) => assert_eq!(a.range(), b.range()),
-            (EventSection(a), EventSection(b)) => assert_eq!(a.range(), b.range()),
+            (TagSection(a), TagSection(b)) => assert_eq!(a.range(), b.range()),
             (StartSection { func: a, range: ar }, StartSection { func: b, range: br }) => {
                 assert_eq!(a, b);
                 assert_eq!(ar, br);
@@ -114,16 +113,19 @@ fuzz_target!(|data: Vec<Vec<u8>>| {
                     name: a,
                     data_offset: ado,
                     data: ad,
+                    range: ar,
                 },
                 CustomSection {
                     name: b,
                     data_offset: bdo,
                     data: bd,
+                    range: br,
                 },
             ) => {
                 assert_eq!(a, b);
                 assert_eq!(ad, bd);
                 assert_eq!(ado, bdo);
+                assert_eq!(ar, br);
             }
             (
                 CodeSectionStart {
@@ -138,12 +140,12 @@ fuzz_target!(|data: Vec<Vec<u8>>| {
                 },
             )
             | (
-                ModuleCodeSectionStart {
+                ModuleSectionStart {
                     count: a,
                     range: ar,
                     size: asz,
                 },
-                ModuleCodeSectionStart {
+                ModuleSectionStart {
                     count: b,
                     range: br,
                     size: bsz,
@@ -158,11 +160,11 @@ fuzz_target!(|data: Vec<Vec<u8>>| {
                 assert_eq!(a.get_binary_reader().range(), b.get_binary_reader().range());
             }
             (
-                ModuleCodeSectionEntry {
+                ModuleSectionEntry {
                     range: ar,
                     parser: ap,
                 },
-                ModuleCodeSectionEntry { range: br, .. },
+                ModuleSectionEntry { range: br, .. },
             ) => {
                 assert_eq!(ar, br);
                 stack.push(parser);

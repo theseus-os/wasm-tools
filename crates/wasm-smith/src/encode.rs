@@ -4,16 +4,6 @@ use std::convert::TryFrom;
 impl Module {
     /// Encode this Wasm module into bytes.
     pub fn to_bytes(&self) -> Vec<u8> {
-        self.inner.to_bytes()
-    }
-}
-
-impl<C> ConfiguredModule<C>
-where
-    C: Config,
-{
-    /// Encode this Wasm module into bytes.
-    pub fn to_bytes(&self) -> Vec<u8> {
         self.encoded().finish()
     }
 
@@ -24,12 +14,12 @@ where
         self.encode_funcs(&mut module);
         self.encode_tables(&mut module);
         self.encode_memories(&mut module);
+        self.encode_tags(&mut module);
         self.encode_globals(&mut module);
         self.encode_exports(&mut module);
         self.encode_start(&mut module);
         self.encode_elems(&mut module);
         self.encode_data_count(&mut module);
-        self.encode_module_code(&mut module);
         self.encode_code(&mut module);
         self.encode_data(&mut module);
 
@@ -97,14 +87,18 @@ where
         let mut section = wasm_encoder::AliasSection::new();
         for alias in imports {
             match alias {
-                Alias::InstanceExport { instance, export } => {
-                    section.instance_export(*instance, translate_export(export));
+                Alias::InstanceExport {
+                    instance,
+                    kind,
+                    name,
+                } => {
+                    section.instance_export(*instance, translate_item_kind(kind), name);
                 }
-                Alias::ParentType(ty) => {
-                    section.parent_type(*ty);
+                Alias::OuterType { depth, index } => {
+                    section.outer_type(*depth, *index);
                 }
-                Alias::ParentModule(m) => {
-                    section.parent_module(*m);
+                Alias::OuterModule { depth, index } => {
+                    section.outer_module(*depth, *index);
                 }
             }
         }
@@ -114,17 +108,38 @@ where
     fn encode_instances(&self, module: &mut wasm_encoder::Module, list: &[Instance]) {
         let mut section = wasm_encoder::InstanceSection::new();
         for instance in list {
-            section.instantiate(instance.module, instance.args.iter().map(translate_export));
+            section.instantiate(
+                instance.module,
+                instance
+                    .args
+                    .iter()
+                    .map(|(name, export)| (name.as_str(), translate_export(export))),
+            );
         }
         module.section(&section);
     }
 
-    fn encode_modules(&self, module: &mut wasm_encoder::Module, list: &[u32]) {
+    fn encode_modules(&self, module: &mut wasm_encoder::Module, list: &[Self]) {
         let mut section = wasm_encoder::ModuleSection::new();
-        for ty in list {
-            section.module(*ty);
+        for module in list {
+            let encoded = module.encoded();
+            section.module(&encoded);
         }
         module.section(&section);
+    }
+
+    fn encode_tags(&self, module: &mut wasm_encoder::Module) {
+        if self.num_defined_tags == 0 {
+            return;
+        }
+        let mut tags = wasm_encoder::TagSection::new();
+        for tag in self.tags[self.tags.len() - self.num_defined_tags..].iter() {
+            tags.tag(wasm_encoder::TagType {
+                kind: wasm_encoder::TagKind::Exception,
+                func_type_idx: tag.func_type_idx,
+            });
+        }
+        module.section(&tags);
     }
 
     fn encode_funcs(&self, module: &mut wasm_encoder::Module) {
@@ -177,8 +192,8 @@ where
             return;
         }
         let mut exports = wasm_encoder::ExportSection::new();
-        for (name, exp) in &self.exports {
-            exports.export(name, translate_export(exp));
+        for (name, export) in &self.exports {
+            exports.export(name, translate_export(export));
         }
         module.section(&exports);
     }
@@ -235,17 +250,6 @@ where
         module.section(&wasm_encoder::DataCountSection {
             count: u32::try_from(self.data.len()).unwrap(),
         });
-    }
-
-    fn encode_module_code(&self, module: &mut wasm_encoder::Module) {
-        if self.defined_modules.is_empty() {
-            return;
-        }
-        let mut code = wasm_encoder::ModuleCodeSection::new();
-        for module in &self.defined_modules {
-            code.module(&module.encoded());
-        }
-        module.section(&code);
     }
 
     fn encode_code(&self, module: &mut wasm_encoder::Module) {
@@ -306,6 +310,7 @@ fn translate_val_type(ty: ValType) -> wasm_encoder::ValType {
         ValType::I64 => wasm_encoder::ValType::I64,
         ValType::F32 => wasm_encoder::ValType::F32,
         ValType::F64 => wasm_encoder::ValType::F64,
+        ValType::V128 => wasm_encoder::ValType::V128,
         ValType::FuncRef => wasm_encoder::ValType::FuncRef,
         ValType::ExternRef => wasm_encoder::ValType::ExternRef,
     }
@@ -313,6 +318,10 @@ fn translate_val_type(ty: ValType) -> wasm_encoder::ValType {
 
 fn translate_entity_type(ty: &EntityType) -> wasm_encoder::EntityType {
     match ty {
+        EntityType::Tag(t) => wasm_encoder::EntityType::Tag(wasm_encoder::TagType {
+            kind: wasm_encoder::TagKind::Exception,
+            func_type_idx: t.func_type_idx,
+        }),
         EntityType::Func(f, _) => wasm_encoder::EntityType::Function(*f),
         EntityType::Instance(i, _) => wasm_encoder::EntityType::Instance(*i),
         EntityType::Module(i, _) => wasm_encoder::EntityType::Module(*i),
@@ -322,23 +331,19 @@ fn translate_entity_type(ty: &EntityType) -> wasm_encoder::EntityType {
     }
 }
 
-fn translate_limits(limits: &Limits) -> wasm_encoder::Limits {
-    wasm_encoder::Limits {
-        min: limits.min,
-        max: limits.max,
-    }
-}
-
 fn translate_table_type(ty: &TableType) -> wasm_encoder::TableType {
     wasm_encoder::TableType {
         element_type: translate_val_type(ty.elem_ty),
-        limits: translate_limits(&ty.limits),
+        minimum: ty.minimum,
+        maximum: ty.maximum,
     }
 }
 
 fn translate_memory_type(ty: &MemoryType) -> wasm_encoder::MemoryType {
     wasm_encoder::MemoryType {
-        limits: translate_limits(&ty.limits),
+        minimum: ty.minimum,
+        maximum: ty.maximum,
+        memory64: ty.memory64,
     }
 }
 
@@ -365,14 +370,27 @@ fn translate_mem_arg(m: MemArg) -> wasm_encoder::MemArg {
     }
 }
 
-fn translate_export(exp: &Export) -> wasm_encoder::Export {
-    match exp {
-        Export::Func(f) => wasm_encoder::Export::Function(*f),
-        Export::Table(t) => wasm_encoder::Export::Table(*t),
-        Export::Memory(m) => wasm_encoder::Export::Memory(*m),
-        Export::Global(g) => wasm_encoder::Export::Global(*g),
-        Export::Instance(i) => wasm_encoder::Export::Instance(*i),
-        Export::Module(i) => wasm_encoder::Export::Module(*i),
+fn translate_item_kind(kind: &ItemKind) -> wasm_encoder::ItemKind {
+    match kind {
+        ItemKind::Tag => wasm_encoder::ItemKind::Tag,
+        ItemKind::Func => wasm_encoder::ItemKind::Function,
+        ItemKind::Table => wasm_encoder::ItemKind::Table,
+        ItemKind::Memory => wasm_encoder::ItemKind::Memory,
+        ItemKind::Global => wasm_encoder::ItemKind::Global,
+        ItemKind::Instance => wasm_encoder::ItemKind::Instance,
+        ItemKind::Module => wasm_encoder::ItemKind::Module,
+    }
+}
+
+fn translate_export(export: &Export) -> wasm_encoder::Export {
+    match export {
+        Export::Tag(idx) => wasm_encoder::Export::Tag(*idx),
+        Export::Func(idx) => wasm_encoder::Export::Function(*idx),
+        Export::Table(idx) => wasm_encoder::Export::Table(*idx),
+        Export::Memory(idx) => wasm_encoder::Export::Memory(*idx),
+        Export::Global(idx) => wasm_encoder::Export::Global(*idx),
+        Export::Instance(idx) => wasm_encoder::Export::Instance(*idx),
+        Export::Module(idx) => wasm_encoder::Export::Module(*idx),
     }
 }
 
@@ -386,6 +404,10 @@ fn translate_instruction(inst: &Instruction) -> wasm_encoder::Instruction {
         Loop(bt) => wasm_encoder::Instruction::Loop(translate_block_type(bt)),
         If(bt) => wasm_encoder::Instruction::If(translate_block_type(bt)),
         Else => wasm_encoder::Instruction::Else,
+        Try(bt) => wasm_encoder::Instruction::Try(translate_block_type(bt)),
+        Delegate(l) => wasm_encoder::Instruction::Delegate(l),
+        Catch(t) => wasm_encoder::Instruction::Catch(t),
+        CatchAll => wasm_encoder::Instruction::CatchAll,
         End => wasm_encoder::Instruction::End,
         Br(x) => wasm_encoder::Instruction::Br(x),
         BrIf(x) => wasm_encoder::Instruction::BrIf(x),
@@ -393,6 +415,8 @@ fn translate_instruction(inst: &Instruction) -> wasm_encoder::Instruction {
         Return => wasm_encoder::Instruction::Return,
         Call(x) => wasm_encoder::Instruction::Call(x),
         CallIndirect { ty, table } => wasm_encoder::Instruction::CallIndirect { ty, table },
+        Throw(t) => wasm_encoder::Instruction::Throw(t),
+        Rethrow(l) => wasm_encoder::Instruction::Rethrow(l),
 
         // Parametric instructions.
         Drop => wasm_encoder::Instruction::Drop,
@@ -589,5 +613,312 @@ fn translate_instruction(inst: &Instruction) -> wasm_encoder::Instruction {
         TableGrow { table } => wasm_encoder::Instruction::TableGrow { table },
         TableSize { table } => wasm_encoder::Instruction::TableSize { table },
         TableCopy { src, dst } => wasm_encoder::Instruction::TableCopy { src, dst },
+
+        // SIMD instructions.
+        V128Load { memarg } => wasm_encoder::Instruction::V128Load {
+            memarg: translate_mem_arg(memarg),
+        },
+        V128Load8x8S { memarg } => wasm_encoder::Instruction::V128Load8x8S {
+            memarg: translate_mem_arg(memarg),
+        },
+        V128Load8x8U { memarg } => wasm_encoder::Instruction::V128Load8x8U {
+            memarg: translate_mem_arg(memarg),
+        },
+        V128Load16x4S { memarg } => wasm_encoder::Instruction::V128Load16x4S {
+            memarg: translate_mem_arg(memarg),
+        },
+        V128Load16x4U { memarg } => wasm_encoder::Instruction::V128Load16x4U {
+            memarg: translate_mem_arg(memarg),
+        },
+        V128Load32x2S { memarg } => wasm_encoder::Instruction::V128Load32x2S {
+            memarg: translate_mem_arg(memarg),
+        },
+        V128Load32x2U { memarg } => wasm_encoder::Instruction::V128Load32x2U {
+            memarg: translate_mem_arg(memarg),
+        },
+        V128Load8Splat { memarg } => wasm_encoder::Instruction::V128Load8Splat {
+            memarg: translate_mem_arg(memarg),
+        },
+        V128Load16Splat { memarg } => wasm_encoder::Instruction::V128Load16Splat {
+            memarg: translate_mem_arg(memarg),
+        },
+        V128Load32Splat { memarg } => wasm_encoder::Instruction::V128Load32Splat {
+            memarg: translate_mem_arg(memarg),
+        },
+        V128Load64Splat { memarg } => wasm_encoder::Instruction::V128Load64Splat {
+            memarg: translate_mem_arg(memarg),
+        },
+        V128Load32Zero { memarg } => wasm_encoder::Instruction::V128Load32Zero {
+            memarg: translate_mem_arg(memarg),
+        },
+        V128Load64Zero { memarg } => wasm_encoder::Instruction::V128Load64Zero {
+            memarg: translate_mem_arg(memarg),
+        },
+        V128Store { memarg } => wasm_encoder::Instruction::V128Store {
+            memarg: translate_mem_arg(memarg),
+        },
+        V128Load8Lane { memarg, lane } => wasm_encoder::Instruction::V128Load8Lane {
+            memarg: translate_mem_arg(memarg),
+            lane,
+        },
+        V128Load16Lane { memarg, lane } => wasm_encoder::Instruction::V128Load16Lane {
+            memarg: translate_mem_arg(memarg),
+            lane,
+        },
+        V128Load32Lane { memarg, lane } => wasm_encoder::Instruction::V128Load32Lane {
+            memarg: translate_mem_arg(memarg),
+            lane,
+        },
+        V128Load64Lane { memarg, lane } => wasm_encoder::Instruction::V128Load64Lane {
+            memarg: translate_mem_arg(memarg),
+            lane,
+        },
+        V128Store8Lane { memarg, lane } => wasm_encoder::Instruction::V128Store8Lane {
+            memarg: translate_mem_arg(memarg),
+            lane,
+        },
+        V128Store16Lane { memarg, lane } => wasm_encoder::Instruction::V128Store16Lane {
+            memarg: translate_mem_arg(memarg),
+            lane,
+        },
+        V128Store32Lane { memarg, lane } => wasm_encoder::Instruction::V128Store32Lane {
+            memarg: translate_mem_arg(memarg),
+            lane,
+        },
+        V128Store64Lane { memarg, lane } => wasm_encoder::Instruction::V128Store64Lane {
+            memarg: translate_mem_arg(memarg),
+            lane,
+        },
+        V128Const(c) => wasm_encoder::Instruction::V128Const(c),
+        I8x16Shuffle { lanes } => wasm_encoder::Instruction::I8x16Shuffle { lanes },
+        I8x16ExtractLaneS { lane } => wasm_encoder::Instruction::I8x16ExtractLaneS { lane },
+        I8x16ExtractLaneU { lane } => wasm_encoder::Instruction::I8x16ExtractLaneU { lane },
+        I8x16ReplaceLane { lane } => wasm_encoder::Instruction::I8x16ReplaceLane { lane },
+        I16x8ExtractLaneS { lane } => wasm_encoder::Instruction::I16x8ExtractLaneS { lane },
+        I16x8ExtractLaneU { lane } => wasm_encoder::Instruction::I16x8ExtractLaneU { lane },
+        I16x8ReplaceLane { lane } => wasm_encoder::Instruction::I16x8ReplaceLane { lane },
+        I32x4ExtractLane { lane } => wasm_encoder::Instruction::I32x4ExtractLane { lane },
+        I32x4ReplaceLane { lane } => wasm_encoder::Instruction::I32x4ReplaceLane { lane },
+        I64x2ExtractLane { lane } => wasm_encoder::Instruction::I64x2ExtractLane { lane },
+        I64x2ReplaceLane { lane } => wasm_encoder::Instruction::I64x2ReplaceLane { lane },
+        F32x4ExtractLane { lane } => wasm_encoder::Instruction::F32x4ExtractLane { lane },
+        F32x4ReplaceLane { lane } => wasm_encoder::Instruction::F32x4ReplaceLane { lane },
+        F64x2ExtractLane { lane } => wasm_encoder::Instruction::F64x2ExtractLane { lane },
+        F64x2ReplaceLane { lane } => wasm_encoder::Instruction::F64x2ReplaceLane { lane },
+        I8x16Swizzle => wasm_encoder::Instruction::I8x16Swizzle,
+        I8x16Splat => wasm_encoder::Instruction::I8x16Splat,
+        I16x8Splat => wasm_encoder::Instruction::I16x8Splat,
+        I32x4Splat => wasm_encoder::Instruction::I32x4Splat,
+        I64x2Splat => wasm_encoder::Instruction::I64x2Splat,
+        F32x4Splat => wasm_encoder::Instruction::F32x4Splat,
+        F64x2Splat => wasm_encoder::Instruction::F64x2Splat,
+        I8x16Eq => wasm_encoder::Instruction::I8x16Eq,
+        I8x16Ne => wasm_encoder::Instruction::I8x16Ne,
+        I8x16LtS => wasm_encoder::Instruction::I8x16LtS,
+        I8x16LtU => wasm_encoder::Instruction::I8x16LtU,
+        I8x16GtS => wasm_encoder::Instruction::I8x16GtS,
+        I8x16GtU => wasm_encoder::Instruction::I8x16GtU,
+        I8x16LeS => wasm_encoder::Instruction::I8x16LeS,
+        I8x16LeU => wasm_encoder::Instruction::I8x16LeU,
+        I8x16GeS => wasm_encoder::Instruction::I8x16GeS,
+        I8x16GeU => wasm_encoder::Instruction::I8x16GeU,
+        I16x8Eq => wasm_encoder::Instruction::I16x8Eq,
+        I16x8Ne => wasm_encoder::Instruction::I16x8Ne,
+        I16x8LtS => wasm_encoder::Instruction::I16x8LtS,
+        I16x8LtU => wasm_encoder::Instruction::I16x8LtU,
+        I16x8GtS => wasm_encoder::Instruction::I16x8GtS,
+        I16x8GtU => wasm_encoder::Instruction::I16x8GtU,
+        I16x8LeS => wasm_encoder::Instruction::I16x8LeS,
+        I16x8LeU => wasm_encoder::Instruction::I16x8LeU,
+        I16x8GeS => wasm_encoder::Instruction::I16x8GeS,
+        I16x8GeU => wasm_encoder::Instruction::I16x8GeU,
+        I32x4Eq => wasm_encoder::Instruction::I32x4Eq,
+        I32x4Ne => wasm_encoder::Instruction::I32x4Ne,
+        I32x4LtS => wasm_encoder::Instruction::I32x4LtS,
+        I32x4LtU => wasm_encoder::Instruction::I32x4LtU,
+        I32x4GtS => wasm_encoder::Instruction::I32x4GtS,
+        I32x4GtU => wasm_encoder::Instruction::I32x4GtU,
+        I32x4LeS => wasm_encoder::Instruction::I32x4LeS,
+        I32x4LeU => wasm_encoder::Instruction::I32x4LeU,
+        I32x4GeS => wasm_encoder::Instruction::I32x4GeS,
+        I32x4GeU => wasm_encoder::Instruction::I32x4GeU,
+        I64x2Eq => wasm_encoder::Instruction::I64x2Eq,
+        I64x2Ne => wasm_encoder::Instruction::I64x2Ne,
+        I64x2LtS => wasm_encoder::Instruction::I64x2LtS,
+        I64x2GtS => wasm_encoder::Instruction::I64x2GtS,
+        I64x2LeS => wasm_encoder::Instruction::I64x2LeS,
+        I64x2GeS => wasm_encoder::Instruction::I64x2GeS,
+        F32x4Eq => wasm_encoder::Instruction::F32x4Eq,
+        F32x4Ne => wasm_encoder::Instruction::F32x4Ne,
+        F32x4Lt => wasm_encoder::Instruction::F32x4Lt,
+        F32x4Gt => wasm_encoder::Instruction::F32x4Gt,
+        F32x4Le => wasm_encoder::Instruction::F32x4Le,
+        F32x4Ge => wasm_encoder::Instruction::F32x4Ge,
+        F64x2Eq => wasm_encoder::Instruction::F64x2Eq,
+        F64x2Ne => wasm_encoder::Instruction::F64x2Ne,
+        F64x2Lt => wasm_encoder::Instruction::F64x2Lt,
+        F64x2Gt => wasm_encoder::Instruction::F64x2Gt,
+        F64x2Le => wasm_encoder::Instruction::F64x2Le,
+        F64x2Ge => wasm_encoder::Instruction::F64x2Ge,
+        V128Not => wasm_encoder::Instruction::V128Not,
+        V128And => wasm_encoder::Instruction::V128And,
+        V128AndNot => wasm_encoder::Instruction::V128AndNot,
+        V128Or => wasm_encoder::Instruction::V128Or,
+        V128Xor => wasm_encoder::Instruction::V128Xor,
+        V128Bitselect => wasm_encoder::Instruction::V128Bitselect,
+        V128AnyTrue => wasm_encoder::Instruction::V128AnyTrue,
+        I8x16Abs => wasm_encoder::Instruction::I8x16Abs,
+        I8x16Neg => wasm_encoder::Instruction::I8x16Neg,
+        I8x16Popcnt => wasm_encoder::Instruction::I8x16Popcnt,
+        I8x16AllTrue => wasm_encoder::Instruction::I8x16AllTrue,
+        I8x16Bitmask => wasm_encoder::Instruction::I8x16Bitmask,
+        I8x16NarrowI16x8S => wasm_encoder::Instruction::I8x16NarrowI16x8S,
+        I8x16NarrowI16x8U => wasm_encoder::Instruction::I8x16NarrowI16x8U,
+        I8x16Shl => wasm_encoder::Instruction::I8x16Shl,
+        I8x16ShrS => wasm_encoder::Instruction::I8x16ShrS,
+        I8x16ShrU => wasm_encoder::Instruction::I8x16ShrU,
+        I8x16Add => wasm_encoder::Instruction::I8x16Add,
+        I8x16AddSatS => wasm_encoder::Instruction::I8x16AddSatS,
+        I8x16AddSatU => wasm_encoder::Instruction::I8x16AddSatU,
+        I8x16Sub => wasm_encoder::Instruction::I8x16Sub,
+        I8x16SubSatS => wasm_encoder::Instruction::I8x16SubSatS,
+        I8x16SubSatU => wasm_encoder::Instruction::I8x16SubSatU,
+        I8x16MinS => wasm_encoder::Instruction::I8x16MinS,
+        I8x16MinU => wasm_encoder::Instruction::I8x16MinU,
+        I8x16MaxS => wasm_encoder::Instruction::I8x16MaxS,
+        I8x16MaxU => wasm_encoder::Instruction::I8x16MaxU,
+        I8x16RoundingAverageU => wasm_encoder::Instruction::I8x16RoundingAverageU,
+        I16x8ExtAddPairwiseI8x16S => wasm_encoder::Instruction::I16x8ExtAddPairwiseI8x16S,
+        I16x8ExtAddPairwiseI8x16U => wasm_encoder::Instruction::I16x8ExtAddPairwiseI8x16U,
+        I16x8Abs => wasm_encoder::Instruction::I16x8Abs,
+        I16x8Neg => wasm_encoder::Instruction::I16x8Neg,
+        I16x8Q15MulrSatS => wasm_encoder::Instruction::I16x8Q15MulrSatS,
+        I16x8AllTrue => wasm_encoder::Instruction::I16x8AllTrue,
+        I16x8Bitmask => wasm_encoder::Instruction::I16x8Bitmask,
+        I16x8NarrowI32x4S => wasm_encoder::Instruction::I16x8NarrowI32x4S,
+        I16x8NarrowI32x4U => wasm_encoder::Instruction::I16x8NarrowI32x4U,
+        I16x8ExtendLowI8x16S => wasm_encoder::Instruction::I16x8ExtendLowI8x16S,
+        I16x8ExtendHighI8x16S => wasm_encoder::Instruction::I16x8ExtendHighI8x16S,
+        I16x8ExtendLowI8x16U => wasm_encoder::Instruction::I16x8ExtendLowI8x16U,
+        I16x8ExtendHighI8x16U => wasm_encoder::Instruction::I16x8ExtendHighI8x16U,
+        I16x8Shl => wasm_encoder::Instruction::I16x8Shl,
+        I16x8ShrS => wasm_encoder::Instruction::I16x8ShrS,
+        I16x8ShrU => wasm_encoder::Instruction::I16x8ShrU,
+        I16x8Add => wasm_encoder::Instruction::I16x8Add,
+        I16x8AddSatS => wasm_encoder::Instruction::I16x8AddSatS,
+        I16x8AddSatU => wasm_encoder::Instruction::I16x8AddSatU,
+        I16x8Sub => wasm_encoder::Instruction::I16x8Sub,
+        I16x8SubSatS => wasm_encoder::Instruction::I16x8SubSatS,
+        I16x8SubSatU => wasm_encoder::Instruction::I16x8SubSatU,
+        I16x8Mul => wasm_encoder::Instruction::I16x8Mul,
+        I16x8MinS => wasm_encoder::Instruction::I16x8MinS,
+        I16x8MinU => wasm_encoder::Instruction::I16x8MinU,
+        I16x8MaxS => wasm_encoder::Instruction::I16x8MaxS,
+        I16x8MaxU => wasm_encoder::Instruction::I16x8MaxU,
+        I16x8RoundingAverageU => wasm_encoder::Instruction::I16x8RoundingAverageU,
+        I16x8ExtMulLowI8x16S => wasm_encoder::Instruction::I16x8ExtMulLowI8x16S,
+        I16x8ExtMulHighI8x16S => wasm_encoder::Instruction::I16x8ExtMulHighI8x16S,
+        I16x8ExtMulLowI8x16U => wasm_encoder::Instruction::I16x8ExtMulLowI8x16U,
+        I16x8ExtMulHighI8x16U => wasm_encoder::Instruction::I16x8ExtMulHighI8x16U,
+        I32x4ExtAddPairwiseI16x8S => wasm_encoder::Instruction::I32x4ExtAddPairwiseI16x8S,
+        I32x4ExtAddPairwiseI16x8U => wasm_encoder::Instruction::I32x4ExtAddPairwiseI16x8U,
+        I32x4Abs => wasm_encoder::Instruction::I32x4Abs,
+        I32x4Neg => wasm_encoder::Instruction::I32x4Neg,
+        I32x4AllTrue => wasm_encoder::Instruction::I32x4AllTrue,
+        I32x4Bitmask => wasm_encoder::Instruction::I32x4Bitmask,
+        I32x4ExtendLowI16x8S => wasm_encoder::Instruction::I32x4ExtendLowI16x8S,
+        I32x4ExtendHighI16x8S => wasm_encoder::Instruction::I32x4ExtendHighI16x8S,
+        I32x4ExtendLowI16x8U => wasm_encoder::Instruction::I32x4ExtendLowI16x8U,
+        I32x4ExtendHighI16x8U => wasm_encoder::Instruction::I32x4ExtendHighI16x8U,
+        I32x4Shl => wasm_encoder::Instruction::I32x4Shl,
+        I32x4ShrS => wasm_encoder::Instruction::I32x4ShrS,
+        I32x4ShrU => wasm_encoder::Instruction::I32x4ShrU,
+        I32x4Add => wasm_encoder::Instruction::I32x4Add,
+        I32x4Sub => wasm_encoder::Instruction::I32x4Sub,
+        I32x4Mul => wasm_encoder::Instruction::I32x4Mul,
+        I32x4MinS => wasm_encoder::Instruction::I32x4MinS,
+        I32x4MinU => wasm_encoder::Instruction::I32x4MinU,
+        I32x4MaxS => wasm_encoder::Instruction::I32x4MaxS,
+        I32x4MaxU => wasm_encoder::Instruction::I32x4MaxU,
+        I32x4DotI16x8S => wasm_encoder::Instruction::I32x4DotI16x8S,
+        I32x4ExtMulLowI16x8S => wasm_encoder::Instruction::I32x4ExtMulLowI16x8S,
+        I32x4ExtMulHighI16x8S => wasm_encoder::Instruction::I32x4ExtMulHighI16x8S,
+        I32x4ExtMulLowI16x8U => wasm_encoder::Instruction::I32x4ExtMulLowI16x8U,
+        I32x4ExtMulHighI16x8U => wasm_encoder::Instruction::I32x4ExtMulHighI16x8U,
+        I64x2Abs => wasm_encoder::Instruction::I64x2Abs,
+        I64x2Neg => wasm_encoder::Instruction::I64x2Neg,
+        I64x2AllTrue => wasm_encoder::Instruction::I64x2AllTrue,
+        I64x2Bitmask => wasm_encoder::Instruction::I64x2Bitmask,
+        I64x2ExtendLowI32x4S => wasm_encoder::Instruction::I64x2ExtendLowI32x4S,
+        I64x2ExtendHighI32x4S => wasm_encoder::Instruction::I64x2ExtendHighI32x4S,
+        I64x2ExtendLowI32x4U => wasm_encoder::Instruction::I64x2ExtendLowI32x4U,
+        I64x2ExtendHighI32x4U => wasm_encoder::Instruction::I64x2ExtendHighI32x4U,
+        I64x2Shl => wasm_encoder::Instruction::I64x2Shl,
+        I64x2ShrS => wasm_encoder::Instruction::I64x2ShrS,
+        I64x2ShrU => wasm_encoder::Instruction::I64x2ShrU,
+        I64x2Add => wasm_encoder::Instruction::I64x2Add,
+        I64x2Sub => wasm_encoder::Instruction::I64x2Sub,
+        I64x2Mul => wasm_encoder::Instruction::I64x2Mul,
+        I64x2ExtMulLowI32x4S => wasm_encoder::Instruction::I64x2ExtMulLowI32x4S,
+        I64x2ExtMulHighI32x4S => wasm_encoder::Instruction::I64x2ExtMulHighI32x4S,
+        I64x2ExtMulLowI32x4U => wasm_encoder::Instruction::I64x2ExtMulLowI32x4U,
+        I64x2ExtMulHighI32x4U => wasm_encoder::Instruction::I64x2ExtMulHighI32x4U,
+        F32x4Ceil => wasm_encoder::Instruction::F32x4Ceil,
+        F32x4Floor => wasm_encoder::Instruction::F32x4Floor,
+        F32x4Trunc => wasm_encoder::Instruction::F32x4Trunc,
+        F32x4Nearest => wasm_encoder::Instruction::F32x4Nearest,
+        F32x4Abs => wasm_encoder::Instruction::F32x4Abs,
+        F32x4Neg => wasm_encoder::Instruction::F32x4Neg,
+        F32x4Sqrt => wasm_encoder::Instruction::F32x4Sqrt,
+        F32x4Add => wasm_encoder::Instruction::F32x4Add,
+        F32x4Sub => wasm_encoder::Instruction::F32x4Sub,
+        F32x4Mul => wasm_encoder::Instruction::F32x4Mul,
+        F32x4Div => wasm_encoder::Instruction::F32x4Div,
+        F32x4Min => wasm_encoder::Instruction::F32x4Min,
+        F32x4Max => wasm_encoder::Instruction::F32x4Max,
+        F32x4PMin => wasm_encoder::Instruction::F32x4PMin,
+        F32x4PMax => wasm_encoder::Instruction::F32x4PMax,
+        F64x2Ceil => wasm_encoder::Instruction::F64x2Ceil,
+        F64x2Floor => wasm_encoder::Instruction::F64x2Floor,
+        F64x2Trunc => wasm_encoder::Instruction::F64x2Trunc,
+        F64x2Nearest => wasm_encoder::Instruction::F64x2Nearest,
+        F64x2Abs => wasm_encoder::Instruction::F64x2Abs,
+        F64x2Neg => wasm_encoder::Instruction::F64x2Neg,
+        F64x2Sqrt => wasm_encoder::Instruction::F64x2Sqrt,
+        F64x2Add => wasm_encoder::Instruction::F64x2Add,
+        F64x2Sub => wasm_encoder::Instruction::F64x2Sub,
+        F64x2Mul => wasm_encoder::Instruction::F64x2Mul,
+        F64x2Div => wasm_encoder::Instruction::F64x2Div,
+        F64x2Min => wasm_encoder::Instruction::F64x2Min,
+        F64x2Max => wasm_encoder::Instruction::F64x2Max,
+        F64x2PMin => wasm_encoder::Instruction::F64x2PMin,
+        F64x2PMax => wasm_encoder::Instruction::F64x2PMax,
+        I32x4TruncSatF32x4S => wasm_encoder::Instruction::I32x4TruncSatF32x4S,
+        I32x4TruncSatF32x4U => wasm_encoder::Instruction::I32x4TruncSatF32x4U,
+        F32x4ConvertI32x4S => wasm_encoder::Instruction::F32x4ConvertI32x4S,
+        F32x4ConvertI32x4U => wasm_encoder::Instruction::F32x4ConvertI32x4U,
+        I32x4TruncSatF64x2SZero => wasm_encoder::Instruction::I32x4TruncSatF64x2SZero,
+        I32x4TruncSatF64x2UZero => wasm_encoder::Instruction::I32x4TruncSatF64x2UZero,
+        F64x2ConvertLowI32x4S => wasm_encoder::Instruction::F64x2ConvertLowI32x4S,
+        F64x2ConvertLowI32x4U => wasm_encoder::Instruction::F64x2ConvertLowI32x4U,
+        F32x4DemoteF64x2Zero => wasm_encoder::Instruction::F32x4DemoteF64x2Zero,
+        F64x2PromoteLowF32x4 => wasm_encoder::Instruction::F64x2PromoteLowF32x4,
+        I8x16SwizzleRelaxed => wasm_encoder::Instruction::I8x16SwizzleRelaxed,
+        I32x4TruncSatF32x4SRelaxed => wasm_encoder::Instruction::I32x4TruncSatF32x4SRelaxed,
+        I32x4TruncSatF32x4URelaxed => wasm_encoder::Instruction::I32x4TruncSatF32x4URelaxed,
+        I32x4TruncSatF64x2SZeroRelaxed => wasm_encoder::Instruction::I32x4TruncSatF64x2SZeroRelaxed,
+        I32x4TruncSatF64x2UZeroRelaxed => wasm_encoder::Instruction::I32x4TruncSatF64x2UZeroRelaxed,
+        F32x4FmaRelaxed => wasm_encoder::Instruction::F32x4FmaRelaxed,
+        F32x4FmsRelaxed => wasm_encoder::Instruction::F32x4FmsRelaxed,
+        F64x2FmaRelaxed => wasm_encoder::Instruction::F64x2FmaRelaxed,
+        F64x2FmsRelaxed => wasm_encoder::Instruction::F64x2FmsRelaxed,
+        I8x16LaneSelect => wasm_encoder::Instruction::I8x16LaneSelect,
+        I16x8LaneSelect => wasm_encoder::Instruction::I16x8LaneSelect,
+        I32x4LaneSelect => wasm_encoder::Instruction::I32x4LaneSelect,
+        I64x2LaneSelect => wasm_encoder::Instruction::I64x2LaneSelect,
+        F32x4MinRelaxed => wasm_encoder::Instruction::F32x4MinRelaxed,
+        F32x4MaxRelaxed => wasm_encoder::Instruction::F32x4MaxRelaxed,
+        F64x2MinRelaxed => wasm_encoder::Instruction::F64x2MinRelaxed,
+        F64x2MaxRelaxed => wasm_encoder::Instruction::F64x2MaxRelaxed,
     }
 }

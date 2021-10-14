@@ -6,16 +6,15 @@
   (import "wasi_file" (instance $real-wasi (type $WasiFile)))
 
   (module $CHILD
-    (import "wasi_file" (instance $wasi-file (type $WasiFile)))
+    (import "wasi_file" (instance $wasi-file (type outer 0 $WasiFile)))
     (func $play (export "play")
-      ;; TODO: implement this
-      ;;call $wasi-file.$read
+      call (func $wasi-file "read")
     )
   )
 
 
   (module $VIRTUALIZE
-    (import "wasi_file" (instance $wasi-file (type $WasiFile)))
+    (import "wasi_file" (instance $wasi-file (type outer 0 $WasiFile)))
     (func (export "read") (param i32 i32 i32) (result i32)
       i32.const 0
     )
@@ -24,9 +23,10 @@
     )
   )
 
-  (instance $virt-wasi (instantiate $VIRTUALIZE (instance $real-wasi)))
-  (instance $child (instantiate $CHILD (instance $virt-wasi)))
+  (instance $virt-wasi (instantiate $VIRTUALIZE (import "wasi_file" (instance $real-wasi))))
+  (instance $child (instantiate $CHILD (import "wasi_file" (instance $virt-wasi))))
+
   (func (export "work")
-    call $child.$play
+    call (func $child "play")
   )
 )

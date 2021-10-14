@@ -6,16 +6,14 @@ use super::*;
 ///
 /// ```
 /// use wasm_encoder::{
-///     Export, ExportSection, TableSection, TableType, Limits, Module, ValType,
+///     Export, ExportSection, TableSection, TableType, Module, ValType,
 /// };
 ///
 /// let mut tables = TableSection::new();
 /// tables.table(TableType {
 ///     element_type: ValType::FuncRef,
-///     limits: Limits {
-///         min: 128,
-///         max: None,
-///     },
+///     minimum: 128,
+///     maximum: None,
 /// });
 ///
 /// let mut exports = ExportSection::new();
@@ -28,6 +26,7 @@ use super::*;
 ///
 /// let wasm_bytes = module.finish();
 /// ```
+#[derive(Clone, Debug)]
 pub struct ExportSection {
     bytes: Vec<u8>,
     num_added: u32,
@@ -40,6 +39,11 @@ impl ExportSection {
             bytes: vec![],
             num_added: 0,
         }
+    }
+
+    /// How many exports have been defined inside this section so far?
+    pub fn len(&self) -> u32 {
+        self.num_added
     }
 
     /// Define an export.
@@ -71,6 +75,7 @@ impl Section for ExportSection {
 }
 
 /// A WebAssembly export.
+#[derive(Clone, Copy, Debug)]
 pub enum Export {
     /// An export of the `n`th function.
     Function(u32),
@@ -80,6 +85,8 @@ pub enum Export {
     Memory(u32),
     /// An export of the `n`th global.
     Global(u32),
+    /// An export of the `n`th tag.
+    Tag(u32),
     /// An export of the `n`th instance.
     ///
     /// Note that this is part of the [module linking proposal][proposal] and is
@@ -98,31 +105,50 @@ pub enum Export {
 
 impl Export {
     pub(crate) fn encode(&self, bytes: &mut Vec<u8>) {
-        match *self {
+        let idx = match *self {
             Export::Function(x) => {
-                bytes.push(0x00);
-                bytes.extend(encoders::u32(x));
+                bytes.push(ItemKind::Function as u8);
+                x
             }
             Export::Table(x) => {
-                bytes.push(0x01);
-                bytes.extend(encoders::u32(x));
+                bytes.push(ItemKind::Table as u8);
+                x
             }
             Export::Memory(x) => {
-                bytes.push(0x02);
-                bytes.extend(encoders::u32(x));
+                bytes.push(ItemKind::Memory as u8);
+                x
             }
             Export::Global(x) => {
-                bytes.push(0x03);
-                bytes.extend(encoders::u32(x));
+                bytes.push(ItemKind::Global as u8);
+                x
             }
-            Export::Module(x) => {
-                bytes.push(0x05);
-                bytes.extend(encoders::u32(x));
+            Export::Tag(x) => {
+                bytes.push(ItemKind::Tag as u8);
+                x
             }
             Export::Instance(x) => {
-                bytes.push(0x06);
-                bytes.extend(encoders::u32(x));
+                bytes.push(ItemKind::Instance as u8);
+                x
             }
-        }
+            Export::Module(x) => {
+                bytes.push(ItemKind::Module as u8);
+                x
+            }
+        };
+        bytes.extend(encoders::u32(idx));
     }
+}
+
+/// Kinds of WebAssembly items
+#[allow(missing_docs)]
+#[repr(u8)]
+#[derive(Clone, Copy, Debug)]
+pub enum ItemKind {
+    Function = 0x00,
+    Table = 0x01,
+    Memory = 0x02,
+    Global = 0x03,
+    Tag = 0x04,
+    Module = 0x05,
+    Instance = 0x06,
 }

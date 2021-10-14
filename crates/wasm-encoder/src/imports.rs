@@ -6,17 +6,16 @@ use std::convert::TryFrom;
 /// # Example
 ///
 /// ```
-/// use wasm_encoder::{Module, ImportSection, MemoryType, Limits};
+/// use wasm_encoder::{Module, ImportSection, MemoryType};
 ///
 /// let mut imports = ImportSection::new();
 /// imports.import(
 ///     "env",
 ///     Some("memory"),
 ///     MemoryType {
-///         limits: Limits {
-///             min: 1,
-///             max: None,
-///         }
+///         minimum: 1,
+///         maximum: None,
+///         memory64: false,
 ///     }
 /// );
 ///
@@ -25,6 +24,7 @@ use std::convert::TryFrom;
 ///
 /// let wasm_bytes = module.finish();
 /// ```
+#[derive(Clone, Debug)]
 pub struct ImportSection {
     bytes: Vec<u8>,
     num_added: u32,
@@ -37,6 +37,11 @@ impl ImportSection {
             bytes: vec![],
             num_added: 0,
         }
+    }
+
+    /// How many imports have been defined inside this section so far?
+    pub fn len(&self) -> u32 {
+        self.num_added
     }
 
     /// Define an import.
@@ -80,6 +85,7 @@ impl Section for ImportSection {
 }
 
 /// The type of an entity.
+#[derive(Clone, Copy, Debug)]
 pub enum EntityType {
     /// The `n`th type, which is a function.
     Function(u32),
@@ -89,6 +95,8 @@ pub enum EntityType {
     Memory(MemoryType),
     /// A global type.
     Global(GlobalType),
+    /// A tag type.
+    Tag(TagType),
     /// The `n`th type, which is an instance.
     Instance(u32),
     /// The `n`th type, which is a module.
@@ -117,6 +125,12 @@ impl From<GlobalType> for EntityType {
     }
 }
 
+impl From<TagType> for EntityType {
+    fn from(t: TagType) -> Self {
+        EntityType::Tag(t)
+    }
+}
+
 impl EntityType {
     pub(crate) fn encode(&self, dst: &mut Vec<u8>) {
         match self {
@@ -134,6 +148,10 @@ impl EntityType {
             }
             EntityType::Global(ty) => {
                 dst.push(0x03);
+                ty.encode(dst);
+            }
+            EntityType::Tag(ty) => {
+                dst.push(0x04);
                 ty.encode(dst);
             }
             EntityType::Module(ty) => {

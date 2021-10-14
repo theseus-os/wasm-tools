@@ -29,6 +29,11 @@ const FEATURES: &[(&str, &str, fn(&mut WasmFeatures) -> &mut bool)] = &[
     ("multi-memory", "wasm multi-memory feature", |f| {
         &mut f.multi_memory
     }),
+    (
+        "exception-handling",
+        "wasm exception-handling feature",
+        |f| &mut f.exceptions,
+    ),
     ("memory64", "wasm memory64 feature", |f| &mut f.memory64),
 ];
 
@@ -89,17 +94,11 @@ fn main() -> Result<()> {
     let mut validator = Validator::new();
     validator.wasm_features(features);
     let mut functions_to_validate = Vec::new();
-    let mut stack = Vec::new();
     let wasm = std::fs::read(input).context(format!("failed to read input: {}", input))?;
     let start = Instant::now();
     for payload in Parser::new(0).parse_all(&wasm) {
         match validator.payload(&payload?)? {
-            ValidPayload::Ok => {}
-            ValidPayload::Pop => validator = stack.pop().unwrap(),
-            ValidPayload::Push(_parser, next) => {
-                stack.push(validator);
-                validator = next;
-            }
+            ValidPayload::Ok | ValidPayload::Submodule(_) => {}
             ValidPayload::Func(validator, body) => functions_to_validate.push((validator, body)),
         }
     }

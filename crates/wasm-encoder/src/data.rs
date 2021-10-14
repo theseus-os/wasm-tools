@@ -6,16 +6,15 @@ use super::*;
 ///
 /// ```
 /// use wasm_encoder::{
-///     DataSection, Instruction, Limits, MemorySection, MemoryType,
+///     DataSection, Instruction, MemorySection, MemoryType,
 ///     Module,
 /// };
 ///
 /// let mut memory = MemorySection::new();
 /// memory.memory(MemoryType {
-///     limits: Limits {
-///         min: 1,
-///         max: None,
-///     },
+///     minimum: 1,
+///     maximum: None,
+///     memory64: false,
 /// });
 ///
 /// let mut data = DataSection::new();
@@ -31,12 +30,14 @@ use super::*;
 ///
 /// let wasm_bytes = module.finish();
 /// ```
+#[derive(Clone, Debug)]
 pub struct DataSection {
     bytes: Vec<u8>,
     num_added: u32,
 }
 
 /// A segment in the data section.
+#[derive(Clone, Copy, Debug)]
 pub struct DataSegment<'a, D> {
     /// This data segment's mode.
     pub mode: DataSegmentMode<'a>,
@@ -45,6 +46,7 @@ pub struct DataSegment<'a, D> {
 }
 
 /// A data segment's mode.
+#[derive(Clone, Copy, Debug)]
 pub enum DataSegmentMode<'a> {
     /// An active data segment.
     Active {
@@ -66,6 +68,11 @@ impl DataSection {
             bytes: vec![],
             num_added: 0,
         }
+    }
+
+    /// How many segments have been defined inside this section so far?
+    pub fn len(&self) -> u32 {
+        self.num_added
     }
 
     /// Define an active data segment.
@@ -161,6 +168,7 @@ impl Section for DataSection {
 }
 
 /// An encoder for the data count section.
+#[derive(Clone, Copy, Debug)]
 pub struct DataCountSection {
     /// The number of segments in the data section.
     pub count: u32,

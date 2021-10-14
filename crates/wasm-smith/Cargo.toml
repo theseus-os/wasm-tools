@@ -4,29 +4,26 @@ categories = ["command-line-utilities", "development-tools", "development-tools:
 description = "A WebAssembly test case generator"
 documentation = "https://docs.rs/wasm-smith"
 edition = "2018"
-license = "MPL-2.0"
+license = "Apache-2.0 WITH LLVM-exception"
 name = "wasm-smith"
 readme = "./README.md"
 repository = "https://github.com/bytecodealliance/wasm-tools"
-version = "0.3.0"
-
-[[bin]]
-name = "wasm-smith"
-path = "src/bin/wasm-smith.rs"
-required-features = ["structopt"]
+version = "0.8.0"
+exclude = ["/benches/corpus"]
 
 [[bench]]
 name = "corpus"
 harness = false
 
 [dependencies]
-arbitrary = { version = "0.4.6", features = ["derive"] }
+arbitrary = { version = "1.0.0", features = ["derive"] }
 leb128 = "0.2.4"
-structopt = { version = "0.3.16", optional = true }
-wasm-encoder = { version = "0.2.0", path = "../wasm-encoder" }
+wasm-encoder = { version = "0.7.0", path = "../wasm-encoder" }
+indexmap = "1.6"
 
 [dev-dependencies]
 criterion = "0.3.3"
-libfuzzer-sys = "0.3.4"
+libfuzzer-sys = "0.4.0"
 rand = { version = "0.7.3", features = ["small_rng"] }
 wasmparser = { path = "../wasmparser" }
+wasmprinter = { path = "../wasmprinter" }

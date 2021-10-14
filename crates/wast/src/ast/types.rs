@@ -12,7 +12,7 @@ pub enum ValType<'a> {
     F64,
     V128,
     Ref(RefType<'a>),
-    Rtt(u32, ast::Index<'a>),
+    Rtt(Option<u32>, ast::Index<'a>),
 }
 
 impl<'a> Parse<'a> for ValType<'a> {
@@ -79,12 +79,11 @@ pub enum HeapType<'a> {
     /// A reference to any reference value: anyref. This is part of the GC
     /// proposal.
     Any,
-    /// A reference to an exception: exnref. This is part of the exception
-    /// handling proposal.
-    Exn,
     /// A reference that has an identity that can be compared: eqref. This is
     /// part of the GC proposal.
     Eq,
+    /// A reference to a GC object. This is part of the GC proposal.
+    Data,
     /// An unboxed 31-bit integer: i31ref. This may be going away if there is no common
     /// supertype of all reference types. Part of the GC proposal.
     I31,
@@ -105,12 +104,12 @@ impl<'a> Parse<'a> for HeapType<'a> {
         } else if l.peek::<kw::r#any>() {
             parser.parse::<kw::r#any>()?;
             Ok(HeapType::Any)
-        } else if l.peek::<kw::exn>() {
-            parser.parse::<kw::exn>()?;
-            Ok(HeapType::Exn)
         } else if l.peek::<kw::eq>() {
             parser.parse::<kw::eq>()?;
             Ok(HeapType::Eq)
+        } else if l.peek::<kw::data>() {
+            parser.parse::<kw::data>()?;
+            Ok(HeapType::Data)
         } else if l.peek::<kw::i31>() {
             parser.parse::<kw::i31>()?;
             Ok(HeapType::I31)
@@ -127,8 +126,8 @@ impl<'a> Peek for HeapType<'a> {
         kw::func::peek(cursor)
             || kw::r#extern::peek(cursor)
             || kw::any::peek(cursor)
-            || kw::exn::peek(cursor)
             || kw::eq::peek(cursor)
+            || kw::data::peek(cursor)
             || kw::i31::peek(cursor)
             || (ast::LParen::peek(cursor) && kw::r#type::peek2(cursor))
     }
@@ -170,19 +169,19 @@ impl<'a> RefType<'a> {
         }
     }
 
-    /// An `exnref` as an abbreviation for `(ref null exn)`.
-    pub fn exn() -> Self {
-        RefType {
-            nullable: true,
-            heap: HeapType::Exn,
-        }
-    }
-
     /// An `eqref` as an abbreviation for `(ref null eq)`.
     pub fn eq() -> Self {
         RefType {
             nullable: true,
             heap: HeapType::Eq,
+        }
+    }
+
+    /// An `dataref` as an abbreviation for `(ref null data)`.
+    pub fn data() -> Self {
+        RefType {
+            nullable: true,
+            heap: HeapType::Data,
         }
     }
 
@@ -210,12 +209,12 @@ impl<'a> Parse<'a> for RefType<'a> {
         } else if l.peek::<kw::anyref>() {
             parser.parse::<kw::anyref>()?;
             Ok(RefType::any())
-        } else if l.peek::<kw::exnref>() {
-            parser.parse::<kw::exnref>()?;
-            Ok(RefType::exn())
         } else if l.peek::<kw::eqref>() {
             parser.parse::<kw::eqref>()?;
             Ok(RefType::eq())
+        } else if l.peek::<kw::dataref>() {
+            parser.parse::<kw::dataref>()?;
+            Ok(RefType::data())
         } else if l.peek::<kw::i31ref>() {
             parser.parse::<kw::i31ref>()?;
             Ok(RefType::i31())
@@ -251,8 +250,8 @@ impl<'a> Peek for RefType<'a> {
             || /* legacy */ kw::anyfunc::peek(cursor)
             || kw::externref::peek(cursor)
             || kw::anyref::peek(cursor)
-            || kw::exnref::peek(cursor)
             || kw::eqref::peek(cursor)
+            || kw::dataref::peek(cursor)
             || kw::i31ref::peek(cursor)
             || (ast::LParen::peek(cursor) && kw::r#ref::peek2(cursor))
     }
@@ -614,34 +613,27 @@ pub struct ModuleType<'a> {
     pub imports: Vec<ast::Import<'a>>,
     /// The exports that this module type is expected to have.
     pub exports: Vec<ExportType<'a>>,
-    /// Instances within this module which are entirely exported.
-    pub instance_exports: Vec<(ast::Span, ast::Id<'a>)>,
 }
 
 impl<'a> Parse<'a> for ModuleType<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
+        // See comments in `nested_module.rs` for why this is tested here.
+        if parser.parens_depth() > 100 {
+            return Err(parser.error("module type nesting too deep"));
+        }
+
         let mut imports = Vec::new();
         while parser.peek2::<kw::import>() {
             imports.push(parser.parens(|p| p.parse())?);
         }
         let mut exports = Vec::new();
-        let mut instance_exports = Vec::new();
         while parser.peek2::<kw::export>() {
             parser.parens(|p| {
-                if p.peek2::<ast::Index>() {
-                    let span = p.parse::<kw::export>()?.0;
-                    instance_exports.push((span, p.parse()?));
-                } else {
-                    exports.push(p.parse()?);
-                }
+                exports.push(p.parse()?);
                 Ok(())
             })?;
         }
-        Ok(ModuleType {
-            imports,
-            exports,
-            instance_exports,
-        })
+        Ok(ModuleType { imports, exports })
     }
 }
 
@@ -671,6 +663,11 @@ pub struct InstanceType<'a> {
 
 impl<'a> Parse<'a> for InstanceType<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
+        // See comments in `nested_module.rs` for why this is tested here.
+        if parser.parens_depth() > 100 {
+            return Err(parser.error("instance type nesting too deep"));
+        }
+
         let mut exports = Vec::new();
         while !parser.is_empty() {
             exports.push(parser.parens(|p| p.parse())?);
@@ -739,6 +736,8 @@ pub struct Type<'a> {
     /// An optional identifer to refer to this `type` by as part of name
     /// resolution.
     pub id: Option<ast::Id<'a>>,
+    /// An optional name for this function stored in the custom `name` section.
+    pub name: Option<ast::NameAnnotation<'a>>,
     /// The type that we're declaring.
     pub def: TypeDef<'a>,
 }
@@ -747,6 +746,7 @@ impl<'a> Parse<'a> for Type<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         let span = parser.parse::<kw::r#type>()?.0;
         let id = parser.parse()?;
+        let name = parser.parse()?;
         let def = parser.parens(|parser| {
             let mut l = parser.lookahead1();
             if l.peek::<kw::func>() {
@@ -768,7 +768,12 @@ impl<'a> Parse<'a> for Type<'a> {
                 Err(l.error())
             }
         })?;
-        Ok(Type { span, id, def })
+        Ok(Type {
+            span,
+            id,
+            name,
+            def,
+        })
     }
 }
 
@@ -776,7 +781,7 @@ impl<'a> Parse<'a> for Type<'a> {
 #[derive(Clone, Debug)]
 pub struct TypeUse<'a, T> {
     /// The type that we're referencing, if it was present.
-    pub index: Option<ast::Index<'a>>,
+    pub index: Option<ast::ItemRef<'a, kw::r#type>>,
     /// The inline type, if present.
     pub inline: Option<T>,
 }
@@ -784,9 +789,15 @@ pub struct TypeUse<'a, T> {
 impl<'a, T> TypeUse<'a, T> {
     /// Constructs a new instance of `TypeUse` without an inline definition but
     /// with an index specified.
-    pub fn new_with_index(index: ast::Index<'a>) -> TypeUse<'a, T> {
+    pub fn new_with_index(idx: ast::Index<'a>) -> TypeUse<'a, T> {
         TypeUse {
-            index: Some(index),
+            index: Some(ast::ItemRef::Item {
+                idx,
+                kind: kw::r#type::default(),
+                exports: Vec::new(),
+                #[cfg(wast_check_exhaustive)]
+                visited: true,
+            }),
             inline: None,
         }
     }
@@ -795,10 +806,7 @@ impl<'a, T> TypeUse<'a, T> {
 impl<'a, T: Peek + Parse<'a>> Parse<'a> for TypeUse<'a, T> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         let index = if parser.peek2::<kw::r#type>() {
-            Some(parser.parens(|parser| {
-                parser.parse::<kw::r#type>()?;
-                Ok(parser.parse()?)
-            })?)
+            Some(parser.parse()?)
         } else {
             None
         };

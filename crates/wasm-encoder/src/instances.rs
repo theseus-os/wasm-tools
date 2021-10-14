@@ -14,9 +14,9 @@ use super::*;
 ///
 /// let mut instances = InstanceSection::new();
 /// instances.instantiate(0, vec![
-///     Export::Function(0),
-///     Export::Module(2),
-///     Export::Global(0),
+///     ("x", Export::Function(0)),
+///     ("", Export::Module(2)),
+///     ("foo", Export::Global(0)),
 /// ]);
 ///
 /// let mut module = Module::new();
@@ -24,6 +24,7 @@ use super::*;
 ///
 /// let wasm_bytes = module.finish();
 /// ```
+#[derive(Clone, Debug)]
 pub struct InstanceSection {
     bytes: Vec<u8>,
     num_added: u32,
@@ -38,11 +39,16 @@ impl InstanceSection {
         }
     }
 
+    /// How many instances have been defined inside this section so far?
+    pub fn len(&self) -> u32 {
+        self.num_added
+    }
+
     /// Define an instantiation of the given module with the given items as
     /// arguments to the instantiation.
-    pub fn instantiate<I>(&mut self, module: u32, args: I) -> &mut Self
+    pub fn instantiate<'a, I>(&mut self, module: u32, args: I) -> &mut Self
     where
-        I: IntoIterator<Item = Export>,
+        I: IntoIterator<Item = (&'a str, Export)>,
         I::IntoIter: ExactSizeIterator,
     {
         let args = args.into_iter();
@@ -51,8 +57,9 @@ impl InstanceSection {
         self.bytes.extend(encoders::u32(module));
         self.bytes
             .extend(encoders::u32(u32::try_from(args.len()).unwrap()));
-        for arg in args {
-            arg.encode(&mut self.bytes);
+        for (name, export) in args {
+            self.bytes.extend(encoders::str(name));
+            export.encode(&mut self.bytes);
         }
         self.num_added += 1;
         self

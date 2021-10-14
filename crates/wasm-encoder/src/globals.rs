@@ -21,6 +21,7 @@ use super::*;
 ///
 /// let wasm_bytes = module.finish();
 /// ```
+#[derive(Clone, Debug)]
 pub struct GlobalSection {
     bytes: Vec<u8>,
     num_added: u32,
@@ -33,6 +34,11 @@ impl GlobalSection {
             bytes: vec![],
             num_added: 0,
         }
+    }
+
+    /// How many globals have been defined inside this section so far?
+    pub fn len(&self) -> u32 {
+        self.num_added
     }
 
     /// Define a global.
@@ -65,6 +71,7 @@ impl Section for GlobalSection {
 }
 
 /// A global's type.
+#[derive(Clone, Copy, Debug)]
 pub struct GlobalType {
     /// This global's value type.
     pub val_type: ValType,

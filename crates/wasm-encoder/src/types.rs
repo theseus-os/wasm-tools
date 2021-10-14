@@ -18,6 +18,7 @@ use std::convert::TryFrom;
 ///
 /// let wasm_bytes = module.finish();
 /// ```
+#[derive(Clone, Debug)]
 pub struct TypeSection {
     bytes: Vec<u8>,
     num_added: u32,
@@ -30,6 +31,11 @@ impl TypeSection {
             bytes: vec![],
             num_added: 0,
         }
+    }
+
+    /// How many types have been defined inside this section so far?
+    pub fn len(&self) -> u32 {
+        self.num_added
     }
 
     /// Define a function type.

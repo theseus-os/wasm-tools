@@ -8,6 +8,8 @@ pub struct Memory<'a> {
     pub span: ast::Span,
     /// An optional name to refer to this memory by.
     pub id: Option<ast::Id<'a>>,
+    /// An optional name for this function stored in the custom `name` section.
+    pub name: Option<ast::NameAnnotation<'a>>,
     /// If present, inline export annotations which indicate names this
     /// definition should be exported under.
     pub exports: ast::InlineExport<'a>,
@@ -41,6 +43,7 @@ impl<'a> Parse<'a> for Memory<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         let span = parser.parse::<kw::memory>()?.0;
         let id = parser.parse()?;
+        let name = parser.parse()?;
         let exports = parser.parse()?;
 
         // Afterwards figure out which style this is, either:
@@ -79,6 +82,7 @@ impl<'a> Parse<'a> for Memory<'a> {
         Ok(Memory {
             span,
             id,
+            name,
             exports,
             kind,
         })
@@ -93,6 +97,9 @@ pub struct Data<'a> {
 
     /// The optional name of this data segment
     pub id: Option<ast::Id<'a>>,
+
+    /// An optional name for this data stored in the custom `name` section.
+    pub name: Option<ast::NameAnnotation<'a>>,
 
     /// Whether this data segment is passive or active
     pub kind: DataKind<'a>,
@@ -113,7 +120,7 @@ pub enum DataKind<'a> {
     /// memory on module instantiation.
     Active {
         /// The memory that this `Data` will be associated with.
-        memory: ast::Index<'a>,
+        memory: ast::ItemRef<'a, kw::memory>,
 
         /// Initial offset to load this data segment at
         offset: ast::Expression<'a>,
@@ -124,6 +131,7 @@ impl<'a> Parse<'a> for Data<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         let span = parser.parse::<kw::data>()?.0;
         let id = parser.parse()?;
+        let name = parser.parse()?;
 
         // The `passive` keyword is mentioned in the current spec but isn't
         // mentioned in `wabt` tests, so consider it optional for now
@@ -138,13 +146,16 @@ impl<'a> Parse<'a> for Data<'a> {
         // ... and otherwise we must be attached to a particular memory as well
         // as having an initialization offset.
         } else {
-            let memory = if parser.peek2::<kw::memory>() {
-                Some(parser.parens(|p| {
-                    p.parse::<kw::memory>()?;
-                    p.parse()
-                })?)
+            let memory = if let Some(index) = parser.parse::<Option<ast::IndexOrRef<_>>>()? {
+                index.0
             } else {
-                parser.parse()?
+                ast::ItemRef::Item {
+                    kind: kw::memory(parser.prev_span()),
+                    idx: ast::Index::Num(0, span),
+                    exports: Vec::new(),
+                    #[cfg(wast_check_exhaustive)]
+                    visited: false,
+                }
             };
             let offset = parser.parens(|parser| {
                 if parser.peek::<kw::offset>() {
@@ -152,10 +163,7 @@ impl<'a> Parse<'a> for Data<'a> {
                 }
                 parser.parse()
             })?;
-            DataKind::Active {
-                memory: memory.unwrap_or(ast::Index::Num(0, span)),
-                offset,
-            }
+            DataKind::Active { memory, offset }
         };
 
         let mut data = Vec::new();
@@ -165,6 +173,7 @@ impl<'a> Parse<'a> for Data<'a> {
         Ok(Data {
             span,
             id,
+            name,
             kind,
             data,
         })

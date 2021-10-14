@@ -9,6 +9,8 @@ pub struct Instance<'a> {
     /// An identifier that this instance is resolved with (optionally) for name
     /// resolution.
     pub id: Option<ast::Id<'a>>,
+    /// An optional name for this function stored in the custom `name` section.
+    pub name: Option<ast::NameAnnotation<'a>>,
     /// If present, inline export annotations which indicate names this
     /// definition should be exported under.
     pub exports: ast::InlineExport<'a>,
@@ -30,16 +32,25 @@ pub enum InstanceKind<'a> {
     /// Instances whose instantiation is defined inline.
     Inline {
         /// Module that we're instantiating
-        module: ast::Index<'a>,
-        /// Items used to instantiate the instance
-        items: Vec<ast::ExportKind<'a>>,
+        module: ast::ItemRef<'a, kw::module>,
+        /// Arguments used to instantiate the instance
+        args: Vec<InstanceArg<'a>>,
     },
+}
+
+/// Arguments to the `instantiate` instruction
+#[derive(Debug)]
+#[allow(missing_docs)]
+pub struct InstanceArg<'a> {
+    pub name: &'a str,
+    pub index: ast::ItemRef<'a, ast::ExportKind>,
 }
 
 impl<'a> Parse<'a> for Instance<'a> {
     fn parse(parser: Parser<'a>) -> Result<Self> {
         let span = parser.parse::<kw::instance>()?.0;
         let id = parser.parse()?;
+        let name = parser.parse()?;
         let exports = parser.parse()?;
 
         let kind = if let Some(import) = parser.parse()? {
@@ -50,20 +61,31 @@ impl<'a> Parse<'a> for Instance<'a> {
         } else {
             parser.parens(|p| {
                 p.parse::<kw::instantiate>()?;
-                let module = p.parse()?;
-                let mut items = Vec::new();
+                let module = p.parse::<ast::IndexOrRef<_>>()?.0;
+                let mut args = Vec::new();
                 while !p.is_empty() {
-                    items.push(p.parens(|p| p.parse())?);
+                    args.push(p.parens(|p| p.parse())?);
                 }
-                Ok(InstanceKind::Inline { module, items })
+                Ok(InstanceKind::Inline { module, args })
             })?
         };
 
         Ok(Instance {
             span,
             id,
+            name,
             exports,
             kind,
+        })
+    }
+}
+
+impl<'a> Parse<'a> for InstanceArg<'a> {
+    fn parse(parser: Parser<'a>) -> Result<Self> {
+        parser.parse::<kw::import>()?;
+        Ok(InstanceArg {
+            name: parser.parse()?,
+            index: parser.parse()?,
         })
     }
 }

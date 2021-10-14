@@ -20,6 +20,7 @@ use super::*;
 ///
 /// let wasm_bytes = module.finish();
 /// ```
+#[derive(Clone, Debug)]
 pub struct FunctionSection {
     bytes: Vec<u8>,
     num_added: u32,
@@ -32,6 +33,11 @@ impl FunctionSection {
             bytes: vec![],
             num_added: 0,
         }
+    }
+
+    /// How many functions have been defined inside this section so far?
+    pub fn len(&self) -> u32 {
+        self.num_added
     }
 
     /// Define a function that uses the given type.

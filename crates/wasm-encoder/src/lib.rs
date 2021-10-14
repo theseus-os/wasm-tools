@@ -68,7 +68,7 @@
 //! assert!(wasmparser::validate(&wasm_bytes).is_ok());
 //! ```
 
-#![deny(missing_docs)]
+#![deny(missing_docs, missing_debug_implementations)]
 
 mod aliases;
 mod code;
@@ -80,11 +80,12 @@ mod functions;
 mod globals;
 mod imports;
 mod instances;
+mod linking;
 mod memories;
-mod module_code;
 mod modules;
 mod start;
 mod tables;
+mod tags;
 mod types;
 
 pub use aliases::*;
@@ -97,11 +98,12 @@ pub use functions::*;
 pub use globals::*;
 pub use imports::*;
 pub use instances::*;
+pub use linking::*;
 pub use memories::*;
-pub use module_code::*;
 pub use modules::*;
 pub use start::*;
 pub use tables::*;
+pub use tags::*;
 pub use types::*;
 
 pub mod encoders;
@@ -134,6 +136,7 @@ pub trait Section {
 /// A section made up of uninterpreted, raw bytes.
 ///
 /// Allows you to splat any data into a Wasm section.
+#[derive(Clone, Copy, Debug)]
 pub struct RawSection<'a> {
     /// The id for this section.
     pub id: u8,
@@ -217,37 +220,16 @@ pub enum SectionId {
     Code = 10,
     Data = 11,
     DataCount = 12,
+    Tag = 13,
     Module = 14,
     Instance = 15,
     Alias = 16,
-    ModuleCode = 17,
 }
 
 impl From<SectionId> for u8 {
     #[inline]
     fn from(id: SectionId) -> u8 {
         id as u8
-    }
-}
-
-/// Limits for a table or memory.
-pub struct Limits {
-    /// The minimum size.
-    pub min: u32,
-    /// The (optional) maximum size.
-    pub max: Option<u32>,
-}
-
-impl Limits {
-    fn encode(&self, bytes: &mut Vec<u8>) {
-        if let Some(max) = self.max {
-            bytes.push(0x01);
-            bytes.extend(encoders::u32(self.min));
-            bytes.extend(encoders::u32(max));
-        } else {
-            bytes.push(0x00);
-            bytes.extend(encoders::u32(self.min));
-        }
     }
 }
 
@@ -263,6 +245,10 @@ pub enum ValType {
     F32 = 0x7D,
     /// The `f64` type.
     F64 = 0x7C,
+    /// The `v128` type.
+    ///
+    /// Part of the SIMD proposal.
+    V128 = 0x7B,
     /// The `funcref` type.
     ///
     /// Part of the reference types proposal when used anywhere other than a

@@ -22,7 +22,7 @@ struct Indices {
     globals: u32,
     tables: u32,
     memories: u32,
-    events: u32,
+    tags: u32,
     modules: u32,
     instances: u32,
     types: u32,
@@ -74,9 +74,9 @@ impl<'a> Dump<'a> {
                             write!(me.state, "[memory {}]", i.memories)?;
                             i.memories += 1;
                         }
-                        ImportSectionEntryType::Event(_) => {
-                            write!(me.state, "[event {}]", i.events)?;
-                            i.events += 1;
+                        ImportSectionEntryType::Tag(_) => {
+                            write!(me.state, "[tag {}]", i.tags)?;
+                            i.tags += 1;
                         }
                         ImportSectionEntryType::Table(_) => {
                             write!(me.state, "[table {}]", i.tables)?;
@@ -116,9 +116,9 @@ impl<'a> Dump<'a> {
                     i.memories += 1;
                     me.print(end)
                 })?,
-                Payload::EventSection(s) => self.section(s, "event", |me, end, m| {
-                    write!(me.state, "[event {}] {:?}", i.events, m)?;
-                    i.events += 1;
+                Payload::TagSection(s) => self.section(s, "tag", |me, end, m| {
+                    write!(me.state, "[tag {}] {:?}", i.tags, m)?;
+                    i.tags += 1;
                     me.print(end)
                 })?,
                 Payload::ExportSection(s) => self.section(s, "export", |me, end, e| {
@@ -133,38 +133,34 @@ impl<'a> Dump<'a> {
                 })?,
                 Payload::AliasSection(s) => self.section(s, "alias", |me, end, a| {
                     write!(me.state, "[alias] {:?}", a)?;
-                    match a.kind {
-                        ExternalKind::Function => i.funcs += 1,
-                        ExternalKind::Global => i.globals += 1,
-                        ExternalKind::Module => i.modules += 1,
-                        ExternalKind::Table => i.tables += 1,
-                        ExternalKind::Instance => i.instances += 1,
-                        ExternalKind::Memory => i.memories += 1,
-                        ExternalKind::Event => i.events += 1,
-                        ExternalKind::Type => i.types += 1,
+                    match a {
+                        Alias::InstanceExport { kind, .. } => match kind {
+                            ExternalKind::Function => i.funcs += 1,
+                            ExternalKind::Global => i.globals += 1,
+                            ExternalKind::Module => i.modules += 1,
+                            ExternalKind::Table => i.tables += 1,
+                            ExternalKind::Instance => i.instances += 1,
+                            ExternalKind::Memory => i.memories += 1,
+                            ExternalKind::Tag => i.tags += 1,
+                            ExternalKind::Type => i.types += 1,
+                        },
+                        Alias::OuterType { .. } => i.types += 1,
+                        Alias::OuterModule { .. } => i.modules += 1,
                     }
                     me.print(end)
                 })?,
-                Payload::ModuleSection(s) => {
-                    let mut cnt = 0;
-                    self.section(s, "module", |me, end, m| {
-                        write!(me.state, "[module {}] type {:?}", cnt + i.modules, m)?;
-                        cnt += 1;
-                        me.print(end)
-                    })?
-                }
                 Payload::InstanceSection(s) => {
                     self.section(s, "instance", |me, _end, instance| {
                         write!(
                             me.state,
-                            "[instance {}] module:{}",
+                            "[instance {}] instantiate module:{}",
                             i.instances,
                             instance.module()
                         )?;
                         me.print(instance.original_position())?;
                         i.instances += 1;
-                        me.print_iter(instance.args()?, |me, end, (kind, index)| {
-                            write!(me.state, "[instantiate arg] {:?} {}", kind, index)?;
+                        me.print_iter(instance.args()?, |me, end, arg| {
+                            write!(me.state, "[instantiate arg] {:?}", arg)?;
                             me.print(end)
                         })
                     })?
@@ -261,13 +257,13 @@ impl<'a> Dump<'a> {
                     self.print_ops(body.get_operators_reader()?)?;
                 }
 
-                Payload::ModuleCodeSectionStart { count, range, size } => {
-                    write!(self.state, "module code section")?;
+                Payload::ModuleSectionStart { count, range, size } => {
+                    write!(self.state, "module section")?;
                     self.print(range.start)?;
                     write!(self.state, "{} count", count)?;
                     self.print(range.end - size as usize)?;
                 }
-                Payload::ModuleCodeSectionEntry { parser: _, range } => {
+                Payload::ModuleSectionEntry { parser: _, range } => {
                     write!(self.state, "inline module size")?;
                     self.print(range.start)?;
                     self.nesting += 1;
@@ -277,10 +273,13 @@ impl<'a> Dump<'a> {
 
                 Payload::CustomSection {
                     name,
-                    data,
                     data_offset,
+                    data,
+                    range,
                 } => {
-                    write!(self.state, "custom section: {:?}", name)?;
+                    write!(self.state, "custom section")?;
+                    self.print(range.start)?;
+                    write!(self.state, "name: {:?}", name)?;
                     self.print(data_offset)?;
                     if name == "name" {
                         let mut iter = NameSectionReader::new(data, data_offset)?;
@@ -322,6 +321,49 @@ impl<'a> Dump<'a> {
         Ok(())
     }
 
+    fn print_name_map(&mut self, thing: &str, n: NameMap<'_>) -> Result<()> {
+        write!(self.state, "{} names", thing)?;
+        self.print(n.original_position())?;
+        let mut map = n.get_map()?;
+        write!(self.state, "{} count", map.get_count())?;
+        self.print(map.original_position())?;
+        for _ in 0..map.get_count() {
+            write!(self.state, "{:?}", map.read()?)?;
+            self.print(map.original_position())?;
+        }
+        Ok(())
+    }
+
+    fn print_indirect_name_map(
+        &mut self,
+        thing_a: &str,
+        thing_b: &str,
+        n: IndirectNameMap<'_>,
+    ) -> Result<()> {
+        write!(self.state, "{} names", thing_b)?;
+        self.print(n.original_position())?;
+        let mut outer_map = n.get_indirect_map()?;
+        write!(self.state, "{} count", outer_map.get_indirect_count())?;
+        self.print(outer_map.original_position())?;
+        for _ in 0..outer_map.get_indirect_count() {
+            let inner = outer_map.read()?;
+            write!(
+                self.state,
+                "{} {} {}s",
+                thing_a, inner.indirect_index, thing_b,
+            )?;
+            self.print(inner.original_position())?;
+            let mut map = inner.get_map()?;
+            write!(self.state, "{} count", map.get_count())?;
+            self.print(map.original_position())?;
+            for _ in 0..map.get_count() {
+                write!(self.state, "{:?}", map.read()?)?;
+                self.print(map.original_position())?;
+            }
+        }
+        Ok(())
+    }
+
     fn print_custom_name_section(&mut self, name: Name<'_>, end: usize) -> Result<()> {
         match name {
             Name::Module(n) => {
@@ -330,35 +372,19 @@ impl<'a> Dump<'a> {
                 write!(self.state, "{:?}", n.get_name()?)?;
                 self.print(end)?;
             }
-            Name::Function(n) => {
-                write!(self.state, "function names")?;
-                self.print(n.original_position())?;
-                let mut map = n.get_map()?;
-                write!(self.state, "{} count", map.get_count())?;
-                self.print(map.original_position())?;
-                for _ in 0..map.get_count() {
-                    write!(self.state, "{:?}", map.read()?)?;
-                    self.print(map.original_position())?;
-                }
-            }
-            Name::Local(n) => {
-                write!(self.state, "local names")?;
-                self.print(n.original_position())?;
-                let mut function_map = n.get_function_local_reader()?;
-                write!(self.state, "{} count", function_map.get_count())?;
-                self.print(function_map.original_position())?;
-                for _ in 0..function_map.get_count() {
-                    let function_names = function_map.read()?;
-                    write!(self.state, "function {} locals", function_names.func_index)?;
-                    self.print(function_names.original_position())?;
-                    let mut map = function_names.get_map()?;
-                    write!(self.state, "{} count", map.get_count())?;
-                    self.print(map.original_position())?;
-                    for _ in 0..map.get_count() {
-                        write!(self.state, "{:?}", map.read()?)?;
-                        self.print(map.original_position())?;
-                    }
-                }
+            Name::Function(n) => self.print_name_map("function", n)?,
+            Name::Local(n) => self.print_indirect_name_map("function", "local", n)?,
+            Name::Label(n) => self.print_indirect_name_map("function", "label", n)?,
+            Name::Type(n) => self.print_name_map("type", n)?,
+            Name::Table(n) => self.print_name_map("table", n)?,
+            Name::Memory(n) => self.print_name_map("memory", n)?,
+            Name::Global(n) => self.print_name_map("global", n)?,
+            Name::Element(n) => self.print_name_map("element", n)?,
+            Name::Data(n) => self.print_name_map("data", n)?,
+            Name::Unknown { ty, range, .. } => {
+                write!(self.state, "unknown names: {}", ty)?;
+                self.print(range.start)?;
+                self.print(end)?;
             }
         }
         Ok(())

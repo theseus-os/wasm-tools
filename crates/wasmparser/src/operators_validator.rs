@@ -23,9 +23,7 @@
 // the various methods here.
 
 use crate::limits::MAX_WASM_FUNCTION_LOCALS;
-use crate::primitives::{
-    EventType, MemoryImmediate, Operator, SIMDLaneIndex, Type, TypeOrFuncType,
-};
+use crate::primitives::{MemoryImmediate, Operator, SIMDLaneIndex, Type, TypeOrFuncType};
 use crate::{BinaryReaderError, Result, WasmFeatures, WasmFuncType, WasmModuleResources};
 
 use alloc::{format, string::String, vec, vec::Vec};
@@ -46,7 +44,7 @@ macro_rules! format_op_err {
 /// Early return an `Err(OperatorValidatorError)` with a format string.
 macro_rules! bail_op_err {
     ( $( $arg:expr ),* $(,)* ) => {
-        return Err(format_op_err!( $( $arg ),* ));
+        return Err(format_op_err!( $( $arg ),* ))
     }
 }
 
@@ -91,7 +89,10 @@ pub(crate) struct OperatorValidator {
 
     // This is a list of flags for wasm features which are used to gate various
     // instructions.
-    features: WasmFeatures,
+    pub(crate) features: WasmFeatures,
+
+    // Temporary storage used during the validation of `br_table`.
+    br_table_tmp: Vec<Option<Type>>,
 }
 
 // This structure corresponds to `ctrl_frame` as specified at in the validation
@@ -117,7 +118,6 @@ enum FrameKind {
     Try,
     Catch,
     CatchAll,
-    Unwind,
 }
 
 impl OperatorValidator {
@@ -144,6 +144,7 @@ impl OperatorValidator {
                 unreachable: false,
             }],
             features: *features,
+            br_table_tmp: Vec::new(),
         })
     }
 
@@ -229,23 +230,16 @@ impl OperatorValidator {
         } else {
             self.operands.pop().unwrap()
         };
-        let actual_ty = match actual {
-            Some(ty) => ty,
-            None => return Ok(expected),
-        };
-        let expected_ty = match expected {
-            Some(ty) => ty,
-            None => return Ok(actual),
-        };
-        if actual_ty != expected_ty {
-            bail_op_err!(
-                "type mismatch: expected {}, found {}",
-                ty_to_str(expected_ty),
-                ty_to_str(actual_ty)
-            )
-        } else {
-            Ok(actual)
+        if let (Some(actual_ty), Some(expected_ty)) = (actual, expected) {
+            if actual_ty != expected_ty {
+                bail_op_err!(
+                    "type mismatch: expected {}, found {}",
+                    ty_to_str(expected_ty),
+                    ty_to_str(actual_ty)
+                )
+            }
         }
+        Ok(actual)
     }
 
     /// Flags the current control frame as unreachable, additionally truncating
@@ -358,6 +352,11 @@ impl OperatorValidator {
                 "alignment must not be larger than natural",
             ));
         }
+        if index_ty == Type::I32 && memarg.offset > u64::from(u32::MAX) {
+            return Err(OperatorValidatorError::new(
+                "offset out of range: must be <= 2**32",
+            ));
+        }
         Ok(index_ty)
     }
 
@@ -398,6 +397,18 @@ impl OperatorValidator {
     fn check_simd_enabled(&self) -> OperatorValidatorResult<()> {
         if !self.features.simd {
             return Err(OperatorValidatorError::new("SIMD support is not enabled"));
+        }
+        Ok(())
+    }
+
+    fn check_relaxed_simd_enabled(&self) -> OperatorValidatorResult<()> {
+        // Relaxed SIMD operators make sense only with SIMD and be non-deterministic.
+        self.check_non_deterministic_enabled()?;
+        self.check_simd_enabled()?;
+        if !self.features.relaxed_simd {
+            return Err(OperatorValidatorError::new(
+                "Relaxed SIMD support is not enabled",
+            ));
         }
         Ok(())
     }
@@ -582,24 +593,10 @@ impl OperatorValidator {
             }
             Operator::Else => {
                 let frame = self.pop_ctrl(resources)?;
-                // The `catch_all` instruction shares an opcode with `else`,
-                // so we check the frame to see how it's interpreted.
-                match frame.kind {
-                    FrameKind::If => {
-                        self.push_ctrl(FrameKind::Else, frame.block_type, resources)?
-                    }
-                    FrameKind::Try | FrameKind::Catch => {
-                        // We assume `self.features.exceptions` is true when
-                        // these frame kinds are present.
-                        self.control.push(Frame {
-                            kind: FrameKind::CatchAll,
-                            block_type: frame.block_type,
-                            height: self.operands.len(),
-                            unreachable: false,
-                        });
-                    }
-                    _ => bail_op_err!("else found outside of an `if` block"),
+                if frame.kind != FrameKind::If {
+                    bail_op_err!("else found outside of an `if` block");
                 }
+                self.push_ctrl(FrameKind::Else, frame.block_type, resources)?
             }
             Operator::Try { ty } => {
                 self.check_exceptions_enabled()?;
@@ -623,8 +620,7 @@ impl OperatorValidator {
                     unreachable: false,
                 });
                 // Push exception argument types.
-                let event_ty = event_at(&resources, index)?;
-                let ty = func_type_at(&resources, event_ty.type_index)?;
+                let ty = tag_at(&resources, index)?;
                 for ty in ty.inputs() {
                     self.push_operand(ty)?;
                 }
@@ -632,8 +628,7 @@ impl OperatorValidator {
             Operator::Throw { index } => {
                 self.check_exceptions_enabled()?;
                 // Check values associated with the exception.
-                let event_ty = event_at(&resources, index)?;
-                let ty = func_type_at(&resources, event_ty.type_index)?;
+                let ty = tag_at(&resources, index)?;
                 for ty in ty.inputs().rev() {
                     self.pop_operand(Some(ty))?;
                 }
@@ -652,17 +647,30 @@ impl OperatorValidator {
                 }
                 self.unreachable();
             }
-            Operator::Unwind => {
+            Operator::Delegate { relative_depth } => {
                 self.check_exceptions_enabled()?;
-                // Switch from `try` to an `unwind` frame, so we can check that
-                // the result type is empty.
                 let frame = self.pop_ctrl(resources)?;
                 if frame.kind != FrameKind::Try {
-                    bail_op_err!("unwind found outside of an `try` block");
+                    bail_op_err!("delegate found outside of an `try` block");
+                }
+                // This operation is not a jump, but we need to check the
+                // depth for validity
+                let _ = self.jump(relative_depth)?;
+                for ty in results(frame.block_type, resources)? {
+                    self.push_operand(ty)?;
+                }
+            }
+            Operator::CatchAll => {
+                self.check_exceptions_enabled()?;
+                let frame = self.pop_ctrl(resources)?;
+                if frame.kind == FrameKind::CatchAll {
+                    bail_op_err!("only one catch_all allowed per `try` block");
+                } else if frame.kind != FrameKind::Try && frame.kind != FrameKind::Catch {
+                    bail_op_err!("catch_all found outside of a `try` block");
                 }
                 self.control.push(Frame {
-                    kind: FrameKind::Unwind,
-                    block_type: TypeOrFuncType::Type(Type::EmptyBlockType),
+                    kind: FrameKind::CatchAll,
+                    block_type: frame.block_type,
                     height: self.operands.len(),
                     unreachable: false,
                 });
@@ -678,9 +686,6 @@ impl OperatorValidator {
                     FrameKind::If => {
                         self.push_ctrl(FrameKind::Else, frame.block_type, resources)?;
                         frame = self.pop_ctrl(resources)?;
-                    }
-                    FrameKind::Try => {
-                        bail_op_err!("expected catch block");
                     }
                     _ => (),
                 }
@@ -708,28 +713,28 @@ impl OperatorValidator {
             }
             Operator::BrTable { ref table } => {
                 self.pop_operand(Some(Type::I32))?;
-                let mut label = None;
+                let default = self.jump(table.default())?;
+                let default_types = label_types(default.0, resources, default.1)?;
                 for element in table.targets() {
-                    let (relative_depth, _is_default) = element.map_err(|mut e| {
+                    let relative_depth = element.map_err(|mut e| {
                         e.inner.offset = usize::max_value();
                         OperatorValidatorError(e)
                     })?;
                     let block = self.jump(relative_depth)?;
-                    match label {
-                        None => label = Some(block),
-                        Some(prev) => {
-                            let a = label_types(block.0, resources, block.1)?;
-                            let b = label_types(prev.0, resources, prev.1)?;
-                            if a.ne(b) {
-                                bail_op_err!(
-                                    "type mismatch: br_table target labels have different types"
-                                );
-                            }
-                        }
+                    let tys = label_types(block.0, resources, block.1)?;
+                    if tys.len() != default_types.len() {
+                        bail_op_err!(
+                            "type mismatch: br_table target labels have different number of types"
+                        );
                     }
+                    debug_assert!(self.br_table_tmp.len() == 0);
+                    for ty in tys.rev() {
+                        let ty = self.pop_operand(Some(ty))?;
+                        self.br_table_tmp.push(ty);
+                    }
+                    self.operands.extend(self.br_table_tmp.drain(..).rev());
                 }
-                let (ty, kind) = label.unwrap();
-                for ty in label_types(ty, resources, kind)?.rev() {
+                for ty in default_types.rev() {
                     self.pop_operand(Some(ty))?;
                 }
                 self.unreachable();
@@ -762,19 +767,22 @@ impl OperatorValidator {
             }
             Operator::Select => {
                 self.pop_operand(Some(Type::I32))?;
-                let ty = self.pop_operand(None)?;
-                match self.pop_operand(ty)? {
-                    ty @ Some(Type::I32)
-                    | ty @ Some(Type::I64)
-                    | ty @ Some(Type::F32)
-                    | ty @ Some(Type::F64) => self.operands.push(ty),
-                    ty @ Some(Type::V128) => {
-                        self.check_simd_enabled()?;
-                        self.operands.push(ty)
+                let ty1 = self.pop_operand(None)?;
+                let ty2 = self.pop_operand(None)?;
+                fn is_num(ty: Option<Type>) -> bool {
+                    match ty {
+                        Some(Type::I32) | Some(Type::I64) | Some(Type::F32) | Some(Type::F64)
+                        | Some(Type::V128) | None => true,
+                        _ => false,
                     }
-                    None => self.operands.push(None),
-                    Some(_) => bail_op_err!("type mismatch: select only takes integral types"),
                 }
+                if !is_num(ty1) || !is_num(ty2) {
+                    bail_op_err!("type mismatch: select only takes integral types")
+                }
+                if ty1 != ty2 && ty1 != None && ty2 != None {
+                    bail_op_err!("type mismatch: select operands have different types")
+                }
+                self.operands.push(ty1.or(ty2));
             }
             Operator::TypedSelect { ty } => {
                 self.pop_operand(Some(Type::I32))?;
@@ -1527,6 +1535,19 @@ impl OperatorValidator {
                 self.pop_operand(Some(Type::V128))?;
                 self.push_operand(Type::V128)?;
             }
+            Operator::F32x4FmaRelaxed
+            | Operator::F32x4FmsRelaxed
+            | Operator::F64x4FmaRelaxed
+            | Operator::F64x4FmsRelaxed
+            | Operator::F32x4MinRelaxed
+            | Operator::F32x4MaxRelaxed
+            | Operator::F64x2MinRelaxed
+            | Operator::F64x2MaxRelaxed => {
+                self.check_relaxed_simd_enabled()?;
+                self.pop_operand(Some(Type::V128))?;
+                self.pop_operand(Some(Type::V128))?;
+                self.push_operand(Type::V128)?;
+            }
             Operator::I8x16Eq
             | Operator::I8x16Ne
             | Operator::I8x16LtS
@@ -1557,6 +1578,12 @@ impl OperatorValidator {
             | Operator::I32x4LeU
             | Operator::I32x4GeS
             | Operator::I32x4GeU
+            | Operator::I64x2Eq
+            | Operator::I64x2Ne
+            | Operator::I64x2LtS
+            | Operator::I64x2GtS
+            | Operator::I64x2LeS
+            | Operator::I64x2GeS
             | Operator::V128And
             | Operator::V128AndNot
             | Operator::V128Or
@@ -1610,7 +1637,8 @@ impl OperatorValidator {
             | Operator::I64x2ExtMulLowI32x4S
             | Operator::I64x2ExtMulHighI32x4S
             | Operator::I64x2ExtMulLowI32x4U
-            | Operator::I64x2ExtMulHighI32x4U => {
+            | Operator::I64x2ExtMulHighI32x4U
+            | Operator::I16x8Q15MulrSatS => {
                 self.check_simd_enabled()?;
                 self.pop_operand(Some(Type::V128))?;
                 self.pop_operand(Some(Type::V128))?;
@@ -1630,6 +1658,14 @@ impl OperatorValidator {
             | Operator::F64x2Abs
             | Operator::F64x2Neg
             | Operator::F64x2Sqrt
+            | Operator::F32x4DemoteF64x2Zero
+            | Operator::F64x2PromoteLowF32x4
+            | Operator::F64x2ConvertLowI32x4S
+            | Operator::F64x2ConvertLowI32x4U
+            | Operator::I32x4TruncSatF32x4S
+            | Operator::I32x4TruncSatF32x4U
+            | Operator::I32x4TruncSatF64x2SZero
+            | Operator::I32x4TruncSatF64x2UZero
             | Operator::F32x4ConvertI32x4S
             | Operator::F32x4ConvertI32x4U => {
                 self.check_non_deterministic_enabled()?;
@@ -1640,22 +1676,38 @@ impl OperatorValidator {
             Operator::V128Not
             | Operator::I8x16Abs
             | Operator::I8x16Neg
+            | Operator::I8x16Popcnt
             | Operator::I16x8Abs
             | Operator::I16x8Neg
             | Operator::I32x4Abs
             | Operator::I32x4Neg
+            | Operator::I64x2Abs
             | Operator::I64x2Neg
-            | Operator::I32x4TruncSatF32x4S
-            | Operator::I32x4TruncSatF32x4U
-            | Operator::I16x8WidenLowI8x16S
-            | Operator::I16x8WidenHighI8x16S
-            | Operator::I16x8WidenLowI8x16U
-            | Operator::I16x8WidenHighI8x16U
-            | Operator::I32x4WidenLowI16x8S
-            | Operator::I32x4WidenHighI16x8S
-            | Operator::I32x4WidenLowI16x8U
-            | Operator::I32x4WidenHighI16x8U => {
+            | Operator::I16x8ExtendLowI8x16S
+            | Operator::I16x8ExtendHighI8x16S
+            | Operator::I16x8ExtendLowI8x16U
+            | Operator::I16x8ExtendHighI8x16U
+            | Operator::I32x4ExtendLowI16x8S
+            | Operator::I32x4ExtendHighI16x8S
+            | Operator::I32x4ExtendLowI16x8U
+            | Operator::I32x4ExtendHighI16x8U
+            | Operator::I64x2ExtendLowI32x4S
+            | Operator::I64x2ExtendHighI32x4S
+            | Operator::I64x2ExtendLowI32x4U
+            | Operator::I64x2ExtendHighI32x4U
+            | Operator::I16x8ExtAddPairwiseI8x16S
+            | Operator::I16x8ExtAddPairwiseI8x16U
+            | Operator::I32x4ExtAddPairwiseI16x8S
+            | Operator::I32x4ExtAddPairwiseI16x8U => {
                 self.check_simd_enabled()?;
+                self.pop_operand(Some(Type::V128))?;
+                self.push_operand(Type::V128)?;
+            }
+            Operator::I32x4TruncSatF32x4SRelaxed
+            | Operator::I32x4TruncSatF32x4URelaxed
+            | Operator::I32x4TruncSatF64x2SZeroRelaxed
+            | Operator::I32x4TruncSatF64x2UZeroRelaxed => {
+                self.check_relaxed_simd_enabled()?;
                 self.pop_operand(Some(Type::V128))?;
                 self.push_operand(Type::V128)?;
             }
@@ -1666,15 +1718,25 @@ impl OperatorValidator {
                 self.pop_operand(Some(Type::V128))?;
                 self.push_operand(Type::V128)?;
             }
-            Operator::I8x16AnyTrue
+            Operator::I8x16LaneSelect
+            | Operator::I16x8LaneSelect
+            | Operator::I32x4LaneSelect
+            | Operator::I64x2LaneSelect => {
+                self.check_relaxed_simd_enabled()?;
+                self.pop_operand(Some(Type::V128))?;
+                self.pop_operand(Some(Type::V128))?;
+                self.pop_operand(Some(Type::V128))?;
+                self.push_operand(Type::V128)?;
+            }
+            Operator::V128AnyTrue
             | Operator::I8x16AllTrue
             | Operator::I8x16Bitmask
-            | Operator::I16x8AnyTrue
             | Operator::I16x8AllTrue
             | Operator::I16x8Bitmask
-            | Operator::I32x4AnyTrue
             | Operator::I32x4AllTrue
-            | Operator::I32x4Bitmask => {
+            | Operator::I32x4Bitmask
+            | Operator::I64x2AllTrue
+            | Operator::I64x2Bitmask => {
                 self.check_simd_enabled()?;
                 self.pop_operand(Some(Type::V128))?;
                 self.push_operand(Type::I32)?;
@@ -1698,6 +1760,12 @@ impl OperatorValidator {
             }
             Operator::I8x16Swizzle => {
                 self.check_simd_enabled()?;
+                self.pop_operand(Some(Type::V128))?;
+                self.pop_operand(Some(Type::V128))?;
+                self.push_operand(Type::V128)?;
+            }
+            Operator::I8x16SwizzleRelaxed => {
+                self.check_relaxed_simd_enabled()?;
                 self.pop_operand(Some(Type::V128))?;
                 self.pop_operand(Some(Type::V128))?;
                 self.push_operand(Type::V128)?;
@@ -1742,7 +1810,66 @@ impl OperatorValidator {
                 self.pop_operand(Some(idx))?;
                 self.push_operand(Type::V128)?;
             }
-
+            Operator::V128Load8Lane { memarg, lane } => {
+                self.check_simd_enabled()?;
+                let idx = self.check_memarg(memarg, 0, resources)?;
+                self.check_simd_lane_index(lane, 16)?;
+                self.pop_operand(Some(Type::V128))?;
+                self.pop_operand(Some(idx))?;
+                self.push_operand(Type::V128)?;
+            }
+            Operator::V128Load16Lane { memarg, lane } => {
+                self.check_simd_enabled()?;
+                let idx = self.check_memarg(memarg, 1, resources)?;
+                self.check_simd_lane_index(lane, 8)?;
+                self.pop_operand(Some(Type::V128))?;
+                self.pop_operand(Some(idx))?;
+                self.push_operand(Type::V128)?;
+            }
+            Operator::V128Load32Lane { memarg, lane } => {
+                self.check_simd_enabled()?;
+                let idx = self.check_memarg(memarg, 2, resources)?;
+                self.check_simd_lane_index(lane, 4)?;
+                self.pop_operand(Some(Type::V128))?;
+                self.pop_operand(Some(idx))?;
+                self.push_operand(Type::V128)?;
+            }
+            Operator::V128Load64Lane { memarg, lane } => {
+                self.check_simd_enabled()?;
+                let idx = self.check_memarg(memarg, 3, resources)?;
+                self.check_simd_lane_index(lane, 2)?;
+                self.pop_operand(Some(Type::V128))?;
+                self.pop_operand(Some(idx))?;
+                self.push_operand(Type::V128)?;
+            }
+            Operator::V128Store8Lane { memarg, lane } => {
+                self.check_simd_enabled()?;
+                let idx = self.check_memarg(memarg, 0, resources)?;
+                self.check_simd_lane_index(lane, 16)?;
+                self.pop_operand(Some(Type::V128))?;
+                self.pop_operand(Some(idx))?;
+            }
+            Operator::V128Store16Lane { memarg, lane } => {
+                self.check_simd_enabled()?;
+                let idx = self.check_memarg(memarg, 1, resources)?;
+                self.check_simd_lane_index(lane, 8)?;
+                self.pop_operand(Some(Type::V128))?;
+                self.pop_operand(Some(idx))?;
+            }
+            Operator::V128Store32Lane { memarg, lane } => {
+                self.check_simd_enabled()?;
+                let idx = self.check_memarg(memarg, 2, resources)?;
+                self.check_simd_lane_index(lane, 4)?;
+                self.pop_operand(Some(Type::V128))?;
+                self.pop_operand(Some(idx))?;
+            }
+            Operator::V128Store64Lane { memarg, lane } => {
+                self.check_simd_enabled()?;
+                let idx = self.check_memarg(memarg, 3, resources)?;
+                self.check_simd_lane_index(lane, 2)?;
+                self.pop_operand(Some(Type::V128))?;
+                self.pop_operand(Some(idx))?;
+            }
             Operator::MemoryInit { mem, segment } => {
                 self.check_bulk_memory_enabled()?;
                 let ty = self.check_memory_index(mem, resources)?;
@@ -1763,10 +1890,16 @@ impl OperatorValidator {
                 self.check_bulk_memory_enabled()?;
                 let dst_ty = self.check_memory_index(dst, resources)?;
                 let src_ty = self.check_memory_index(src, resources)?;
+
+                // The length operand here is the smaller of src/dst, which is
+                // i32 if one is i32
                 self.pop_operand(Some(match src_ty {
                     Type::I32 => Type::I32,
                     _ => dst_ty,
                 }))?;
+
+                // ... and the offset into each memory is required to be
+                // whatever the indexing type is for that memory
                 self.pop_operand(Some(src_ty))?;
                 self.pop_operand(Some(dst_ty))?;
             }
@@ -1895,10 +2028,10 @@ fn func_type_at<T: WasmModuleResources>(
         .ok_or_else(|| OperatorValidatorError::new("unknown type: type index out of bounds"))
 }
 
-fn event_at<T: WasmModuleResources>(resources: &T, at: u32) -> OperatorValidatorResult<EventType> {
+fn tag_at<T: WasmModuleResources>(resources: &T, at: u32) -> OperatorValidatorResult<&T::FuncType> {
     resources
-        .event_at(at)
-        .ok_or_else(|| OperatorValidatorError::new("unknown event: event index out of bounds"))
+        .tag_at(at)
+        .ok_or_else(|| OperatorValidatorError::new("unknown tag: tag index out of bounds"))
 }
 
 enum Either<A, B> {
@@ -1919,6 +2052,7 @@ where
         }
     }
 }
+
 impl<A, B> DoubleEndedIterator for Either<A, B>
 where
     A: DoubleEndedIterator,
@@ -1932,10 +2066,26 @@ where
     }
 }
 
+impl<A, B> ExactSizeIterator for Either<A, B>
+where
+    A: ExactSizeIterator,
+    B: ExactSizeIterator<Item = A::Item>,
+{
+    fn len(&self) -> usize {
+        match self {
+            Either::A(a) => a.len(),
+            Either::B(b) => b.len(),
+        }
+    }
+}
+
+trait PreciseIterator: ExactSizeIterator + DoubleEndedIterator {}
+impl<T: ExactSizeIterator + DoubleEndedIterator> PreciseIterator for T {}
+
 fn params<'a>(
     ty: TypeOrFuncType,
     resources: &'a impl WasmModuleResources,
-) -> OperatorValidatorResult<impl DoubleEndedIterator<Item = Type> + 'a> {
+) -> OperatorValidatorResult<impl PreciseIterator<Item = Type> + 'a> {
     Ok(match ty {
         TypeOrFuncType::FuncType(t) => Either::A(func_type_at(resources, t)?.inputs()),
         TypeOrFuncType::Type(_) => Either::B(None.into_iter()),
@@ -1945,7 +2095,7 @@ fn params<'a>(
 fn results<'a>(
     ty: TypeOrFuncType,
     resources: &'a impl WasmModuleResources,
-) -> OperatorValidatorResult<impl DoubleEndedIterator<Item = Type> + 'a> {
+) -> OperatorValidatorResult<impl PreciseIterator<Item = Type> + 'a> {
     Ok(match ty {
         TypeOrFuncType::FuncType(t) => Either::A(func_type_at(resources, t)?.outputs()),
         TypeOrFuncType::Type(Type::EmptyBlockType) => Either::B(None.into_iter()),
@@ -1957,7 +2107,7 @@ fn label_types<'a>(
     ty: TypeOrFuncType,
     resources: &'a impl WasmModuleResources,
     kind: FrameKind,
-) -> OperatorValidatorResult<impl DoubleEndedIterator<Item = Type> + 'a> {
+) -> OperatorValidatorResult<impl PreciseIterator<Item = Type> + 'a> {
     Ok(match kind {
         FrameKind::Loop => Either::A(params(ty, resources)?),
         _ => Either::B(results(ty, resources)?),
