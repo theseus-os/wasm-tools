@@ -2044,7 +2044,7 @@ impl<T> SnapshotList<T> {
     }
 }
 
-impl<T> std::ops::Index<usize> for SnapshotList<T> {
+impl<T> core::ops::Index<usize> for SnapshotList<T> {
     type Output = T;
 
     fn index(&self, index: usize) -> &T {
@@ -2052,7 +2052,7 @@ impl<T> std::ops::Index<usize> for SnapshotList<T> {
     }
 }
 
-impl<T> std::ops::IndexMut<usize> for SnapshotList<T> {
+impl<T> core::ops::IndexMut<usize> for SnapshotList<T> {
     fn index_mut(&mut self, index: usize) -> &mut T {
         self.get_mut(index).unwrap()
     }
