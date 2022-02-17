@@ -12,7 +12,7 @@ A simple event-driven library for parsing WebAssembly binary files.
 edition = "2018"
 
 [dependencies]
-hashbrown = { version = "0.9.1", features = ["ahash"], default-features = false }
+hashbrown = { version = "0.11.2", features = ["ahash"], default-features = false }
 
 [dev-dependencies]
 anyhow = "1.0"
